@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
-from sandbox.components import FusedLinear, ReLU2, RMSNorm
+from archibox.components import FusedLinear, ReLU2, RMSNorm
 
 
 class EncoderLayer(nn.Module):

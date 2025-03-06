@@ -19,8 +19,8 @@ from torch import Tensor
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from sandbox.components import FusedLinear, ReLU2, RMSNorm
-from sandbox.muon import Muon
+from archibox.components import FusedLinear, ReLU2, RMSNorm
+from archibox.muon import Muon
 
 log = logging.getLogger(__name__)
 

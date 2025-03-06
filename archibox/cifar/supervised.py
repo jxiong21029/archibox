@@ -11,9 +11,9 @@ from torch.utils.data import DataLoader, random_split
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import v2
 
-from sandbox.cifar.architecture import VisionTransformer
-from sandbox.components import FusedLinear
-from sandbox.muon import Muon
+from archibox.cifar.architecture import VisionTransformer
+from archibox.components import FusedLinear
+from archibox.muon import Muon
 
 log = logging.getLogger(__name__)
 is_main_process = True
