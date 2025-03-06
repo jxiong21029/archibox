@@ -32,8 +32,8 @@ class Config:
     activation: str = "relu2"
 
     n_steps: int = 2000
-    seq_len: int = 16 * 1024
-    seq_len_valid: int = 32 * 1024
+    seq_len: int = 4 * 1024  # gpu poor moment
+    seq_len_valid: int = 4 * 1024
     valid_every: int = 125
     valid_tokens: int = 10 * 1024 * 1024
     vocab_size: int = 50257
@@ -45,7 +45,7 @@ class Config:
     scalar_lr: float = 0.05
     embed_lr: float = 0.05
     lm_head_lr: float = 0.05
-    value_lr: float = 0.05  # unused if down_proj_muon is True
+    value_lr: float = 0.05  # NOTE: unused if down_proj_muon is True
     adamw_betas: list[float] = field(default_factory=lambda: [0.9, 0.99])
     adamw_weight_decay: float = 0.05
     cooldown_frac: float = 0.4
@@ -67,10 +67,10 @@ class DecoderLayer(nn.Module):
 
         self.attn_norm = RMSNorm(dim, affine=False)
         self.qkv_w = nn.Parameter(torch.randn(3, dim, dim).fmod(2) / math.sqrt(dim) / 2)
-        self.qkv_w._iskey = True
+        self.qkv_w._is_down = False
         self.qk_norm = RMSNorm(head_dim, affine=False)
         self.o_proj = FusedLinear(dim, dim, scale=True)
-        self.o_proj.weight._iskey = False
+        self.o_proj.weight._is_down = True
         self.o_proj.scale.data.zero_()
 
         freqs = (1 / rotary_base) ** torch.linspace(
@@ -93,8 +93,8 @@ class DecoderLayer(nn.Module):
             act,
             FusedLinear(4 * dim, dim, scale=True),
         )
-        self.mlp[1]._iskey = True
-        self.mlp[3]._iskey = False
+        self.mlp[1]._is_down = False
+        self.mlp[3]._is_down = True
         self.mlp[3].scale.data.zero_()
 
     def rotary(self, x_NTHD, shift: int):
@@ -170,13 +170,13 @@ class GPT(nn.Module):
         self.vocab_size = vocab_size
         self.decoder = Decoder(dim, depth)
 
-        out_dim = ((vocab_size - 1) // 64) * 64 + 1
+        out_dim = ((vocab_size - 1) // 64 + 1) * 64
         self.lm_head = FusedLinear(dim, out_dim, scale=True)
         self.lm_head.scale.data.zero_()
 
     def forward(self, input_ids, target_ids):
         assert input_ids.ndim == 1
-        x_NTD = self.embed(input_ids.unsqueeze(0))
+        x_NTD = self.embed(input_ids.unsqueeze(0)).to(torch.bfloat16)
         x_NTD, _ = self.decoder(x_NTD)
         logits_NTD = self.lm_head(x_NTD)
         loss = F.cross_entropy(logits_NTD.squeeze(0), target_ids)
@@ -219,50 +219,33 @@ class Metrics:
     def __init__(self, enabled: bool, use_wandb: bool = True, bufsize=128):
         self.enabled = enabled
         self.use_wandb = use_wandb
-
         self._n = defaultdict(int)
         self._mu = defaultdict(float)
-        self._buf = []
-        self._bufsize = bufsize
 
-    @torch.no_grad
     def push(self, **metrics):
         if not self.enabled:
             return
 
         for k, v in metrics.items():
+            self._n[k] += 1
             if isinstance(v, torch.Tensor):
                 assert v.numel() == 1, f"{k} shape={v.shape}"
-                v = v.detach().to("cpu", non_blocking=True)
-                self._buf.append((k, v))
+                self._mu[k] += (v.float().detach() - self._mu[k]) / self._n[k]
             else:
-                self._buf.append((k, v))
-
-        if len(self._buf) > self._bufsize:
-            self._sync()
-
-    def _sync(self):
-        """moves metric tensors on cuda device to cpu"""
-        torch.cuda.synchronize()
-        for k, v in self._buf:
-            delta = float(v) - self._mu[k]
-            self._n[k] += 1
-            self._mu[k] += delta / self._n[k]
-        self._buf.clear()
+                self._mu[k] += (float(v) - self._mu[k]) / self._n[k]
 
     def report(self):
         """averages metrics and logs to wandb"""
         if not self.enabled:
             return
 
-        if len(self._buf) > 0:
-            self._sync()
-
         results = {}
         for k in self._n:
-            results[k] = self._mu[k]
+            results[k] = self._mu[k].to("cpu", non_blocking=True)
+        torch.cuda.synchronize()
+
         if self.use_wandb:
-            wandb.log(results)
+            wandb.log({k: v.item() for k, v in results})
         else:
             log.info(str(results))
 
@@ -293,7 +276,7 @@ def main():
 
     if is_main_process and not args.no_wandb:
         wandb.init(
-            project="multi-task-agent",
+            project="archibox",
             group="gpt",
             dir="runs/gpt",
             id=args.run_id,
@@ -314,27 +297,27 @@ def main():
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     muon_params = []
-    value_params = []
     scalar_params = []
+    value_params = []
     for p in raw_model.decoder.parameters():
         if p.ndim < 2:
             scalar_params.append(p)
-        elif cfg.down_proj_muon or p._iskey:
+        elif cfg.down_proj_muon or not p._is_down:
             muon_params.append(p)
         else:
             value_params.append(p)
-
+    scalar_params.append(raw_model.lm_head.scale)
     adamw_params = [
         dict(params=scalar_params, lr=cfg.scalar_lr),
-        dict(params=[raw_model.embed], lr=cfg.embed_lr),
-        dict(params=[raw_model.lm_head], lr=cfg.lm_head_lr),
+        dict(params=[raw_model.embed.weight], lr=cfg.embed_lr),
+        dict(params=[raw_model.lm_head.weight], lr=cfg.lm_head_lr),
     ]
     if value_params:
         adamw_params.append(dict(params=value_params, lr=cfg.value_lr))
 
     if is_main_process:
         n_muon_params = sum(p.numel() for p in muon_params)
-        n_adamw_params = sum(p.numel() for group in adamw_params for p in group)
+        n_adamw_params = sum(p.numel() for g in adamw_params for p in g["params"])
         n_adamw_tensors = sum(len(group["params"]) for group in adamw_params)
         n_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total_tensors = len(list(model.parameters()))
@@ -342,7 +325,10 @@ def main():
         log.info(f"AdamW: {n_adamw_params:,} params across {n_adamw_tensors} tensors")
         log.info(f"Total: {n_total_params:,} params across {n_total_tensors} tensors")
         if n_muon_params + n_adamw_params != n_total_params:
-            log.warning(f"{n_muon_params=} + {n_adamw_params=} != {n_total_params=}")
+            raise ValueError(
+                f"{n_muon_params=:,} + {n_adamw_params=:,} = "
+                f"{n_muon_params + n_adamw_params:,} != {n_total_params=:,}"
+            )
 
     muon = ZeroRedundancyOptimizer(
         muon_params,
@@ -354,7 +340,6 @@ def main():
     adamw = ZeroRedundancyOptimizer(
         adamw_params,
         torch.optim.AdamW,
-        lr=cfg.adamw_lr,
         betas=cfg.adamw_betas,
         weight_decay=cfg.adamw_weight_decay,
     )
@@ -363,10 +348,6 @@ def main():
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
 
-    def get_lr(step_):
-        frac_done = step_ / cfg.n_steps
-        return 0.1 + 0.9 * min(1, (1 - frac_done) / cfg.cooldown_frac)
-
     train_loader = distributed_data_generator(
         cfg.seq_len, rank, world_size, valid=False
     )
@@ -374,18 +355,24 @@ def main():
         is_last_step = step == cfg.n_steps
 
         if is_last_step or (cfg.valid_every > 0 and step % cfg.valid_every == 0):
+            valid_loader = distributed_data_generator(
+                cfg.seq_len_valid, rank, world_size, valid=True
+            )
             with torch.no_grad():
                 model.eval()
-                for input_ids, target_ids in distributed_data_generator(
-                    cfg.seq_len_valid, rank, world_size, valid=True
+                for _ in tqdm.trange(
+                    cfg.valid_tokens // cfg.seq_len_valid, desc="validation"
                 ):
+                    input_ids, target_ids = next(valid_loader)
                     loss = model(input_ids, target_ids)
                     metrics.push(valid_loss=loss)
             metrics.report()
             model.train()
 
         if not is_last_step:
-            lr_ratio = get_lr(step)
+            # Learning rate schedule: constant, then linear cooldown to 10%
+            frac_done = step / cfg.n_steps
+            lr_ratio = 0.1 + 0.9 * min(1, (1 - frac_done) / cfg.cooldown_frac)
             for opt in optims:
                 for group in opt.param_groups:
                     group["lr"] = group["initial_lr"] * lr_ratio
