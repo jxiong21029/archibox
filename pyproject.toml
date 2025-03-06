@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sandbox"
+name = "archibox"
 version = "0.1"
 dependencies = [
     "einops",
@@ -26,4 +26,4 @@ line-length = 88
 exclude = ["data", "runs"]
 
 [tool.setuptools]
-packages = ["sandbox"]
+packages = ["archibox"]
