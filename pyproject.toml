@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandbox"
+version = "0.1"
+dependencies = [
+    "einops",
+    "gymnasium",
+    "huggingface-hub",
+    "matplotlib",
+    "numpy",
+    "omegaconf",
+    "pandas",
+    "pytest",
+    "seaborn",
+    "torch",
+    "torchvision",
+    "tqdm",
+]
+
+[tool.ruff]
+line-length = 88
+exclude = ["data", "runs"]
+
+[tool.setuptools]
+packages = ["sandbox"]
