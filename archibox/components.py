@@ -31,9 +31,8 @@ class FusedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # fmod truncated normal trick
         self.weight = nn.Parameter(
-            torch.randn(out_features, in_features).fmod(2) / math.sqrt(in_features) / 2
+            torch.randn(out_features, in_features) / math.sqrt(in_features) / 2
         )
 
         if bias:
