@@ -1,60 +1,49 @@
 import torch
 
+ortho_dtype = (
+    torch.bfloat16
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    else torch.float32
+)
+
 
 @torch.compile
-def newtonschulz5(G, steps: int):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt
-    to use a quintic iteration whose coefficients are selected to maximize the slope at
-    zero. For the purpose of minimizing steps, it turns out to be empirically effective
-    to keep increasing the slope at zero even beyond the point where the iteration no
-    longer converges all the way to one everywhere on the interval. This iteration
-    therefore does not produce UV^T but rather something like US'V^T where S' is
-    diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
+def orthogonalize(G):
+    """Computes the semi-orthogonalization of G with Newton-Schulz iteration."""
     assert G.ndim >= 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.type(ortho_dtype)
     if G.size(-2) > G.size(-1):
         X = X.mT
 
     # Ensure spectral norm is at most 1
-    X /= X.norm(dim=(-2, -1), keepdim=True) + 1e-7
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+
+    # Coefficients from https://leloykun.github.io/ponder/muon-opt-coeffs/
+    A = X @ X.mT
+    X = 4.0848 * X + (-6.8946 * A + 2.9270 * A @ A) @ X
+    A = X @ X.mT
+    X = 3.9505 * X + (-6.3029 * A + 2.6377 * A @ A) @ X
+    A = X @ X.mT
+    X = 3.7418 * X + (-5.5913 * A + 2.3037 * A @ A) @ X
+    A = X @ X.mT
+    X = 2.8769 * X + (-3.1427 * A + 1.2046 * A @ A) @ X
+    A = X @ X.mT
+    X = 2.8366 * X + (-3.0525 * A + 1.2012 * A @ A) @ X
 
     if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
+        # Scale to ensure that the norm of the ROWS of G (i.e. change in output) is 1
+        X = X.mT * (G.size(-2) / G.size(-1)) ** 0.5
+    return X.type_as(G)
 
 
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    """MomentUm Orthogonalized by Newton-schulz.
 
-    https://kellerjordan.github.io/posts/muon/
+    See: https://kellerjordan.github.io/posts/muon/, https://arxiv.org/abs/2409.20325
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization
-    post-processing step, in which each 2D parameter's update is replaced with the
-    nearest orthogonal matrix. To efficiently orthogonalize each update, we use a
-    Newton-Schulz iteration, which has the advantage that it can be stably run in
-    bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer should not be used for the embedding layer, the final fully
-    connected layer, or any {0,1}-D parameters; those should all be optimized by a
-    standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last
-    3 dimensions.
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
+    NOTE: This optimizer should not be used for the embedding layer, the final fully
+    connected layer, or any {0,1}-D parameters; those should be optimized by a standard
+    method (e.g., AdamW).
     """
 
     def __init__(
@@ -64,14 +53,9 @@ class Muon(torch.optim.Optimizer):
         momentum: float = 0.9,
         weight_decay: float = 0.01,
         nesterov: bool = True,
-        ns_steps: int = 5,
     ):
         defaults = dict(
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-            ns_steps=ns_steps,
+            lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov
         )
         super().__init__(params, defaults)
 
@@ -82,7 +66,6 @@ class Muon(torch.optim.Optimizer):
             weight_decay = group["weight_decay"]
             momentum = group["momentum"]
             nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
 
             for param in group["params"]:
                 g = param.grad
@@ -93,17 +76,7 @@ class Muon(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
-
-                buf = buf.lerp_(g, 1 - momentum)
+                buf.lerp_(g, 1 - momentum)
                 g = g.lerp_(buf, momentum) if nesterov else buf
-                g = newtonschulz5(g.reshape(g.size(0), -1), ns_steps)
-
-                # Ensures expected norm of change in output doesn't depend on input dim
-                g = g * max(1, g.size(-2) / g.size(-1)) ** 0.5
-                # If out_dim := g.size(-2) <= in_dim := g.size(-1), then g has rms 1 /
-                # sqrt(in_dim) and is unchanged, so the expected norm of the change in
-                # output is equal to 1. If out_dim := g.size(-2) > in_dim := g.size(-1),
-                # then g has rms 1 / sqrt(out_dim) * (sqrt(out_dim) / sqrt(in_dim)) = 1
-                # / sqrt(in_dim), so the expected norm of the output change is still 1.
-
-                param.sub_(g.view_as(param) + param * weight_decay, alpha=lr)
+                g = orthogonalize(g).add_(param, alpha=weight_decay)
+                param.sub_(g, alpha=lr)
