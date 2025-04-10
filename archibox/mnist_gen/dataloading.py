@@ -12,7 +12,7 @@ def mnist_loader(
 ):
     dataset_path = Path(__file__).parent / "data"
     dataset_path.mkdir(exist_ok=True)
-    dataset = MNIST(dataset_path, train=True, download=True)
+    dataset = MNIST(dataset_path, train=train, download=True)
     images = dataset.data.to(device)
     labels = dataset.targets.to(device)
 
