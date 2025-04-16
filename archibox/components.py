@@ -10,6 +10,15 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 flex_attention = torch.compile(flex_attention, dynamic=False)
 
 
+def make_embedding(num_embeddings: int, embedding_dim: int, dtype=None):
+    embed = nn.Embedding(num_embeddings, embedding_dim)
+    if dtype is not None:
+        embed.to(dtype=dtype)
+    embed.weight._is_embed = True
+    embed.weight.data.mul_(0.5)
+    return embed
+
+
 class ReLU2(nn.Module):
     def forward(self, x: Tensor):
         return F.relu(x).square()
