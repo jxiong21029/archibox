@@ -36,10 +36,9 @@ class MnistVectorFSQConfig:
 
     inpaint_size: int = 10
 
-    latent_ndim: int = 4
-    latent_bins: int = 8
-
     cond_mlp_depth: int = 2  # image (unmasked) -> cond
+    fsq_latent_ndim: int = 4
+    fsq_latent_bins: int = 8
     fsq_prior_depth: int = 2  # cond -> latent logits
     fsq_encoder_depth: int = 2  # image (masked), cond -> latents
     fsq_decoder_depth: int = 2  # latents, cond -> image (masked)
@@ -248,8 +247,8 @@ class MnistVectorFSQ(nn.Module):
             cfg.dim,
             cfg.mlp_dim,
             data_dim=self.cfg.inpaint_size**2,
-            latent_ndim=cfg.latent_ndim,
-            latent_bins=cfg.latent_bins,
+            latent_ndim=cfg.fsq_latent_ndim,
+            latent_bins=cfg.fsq_latent_bins,
             prior_depth=cfg.fsq_prior_depth,
             encoder_depth=cfg.fsq_encoder_depth,
             decoder_depth=cfg.fsq_decoder_depth,

@@ -8,12 +8,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import tqdm
+from einops import rearrange
+from PIL import Image
+
 from archibox.components import FusedLinear, RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.muon import Muon
-from einops import rearrange
-from PIL import Image
 
 log = logging.getLogger(__name__)
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
