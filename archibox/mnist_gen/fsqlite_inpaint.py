@@ -13,16 +13,17 @@ from einops import rearrange
 from PIL import Image
 from torch.distributions import Categorical
 
-from archibox.components import FusedLinear, RMSNorm, make_embedding
+from archibox.components import FusedLinear, ReLU2, RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.muon import Muon
 
 log = logging.getLogger(__name__)
-if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
-    DTYPE = torch.bfloat16
-else:
-    DTYPE = torch.float32
+
+# TODO: ablate:
+# - silu vs silu^2
+# - sqrt(3) scaling on latent
+# - modulation +1
 
 
 @dataclass
@@ -33,23 +34,23 @@ class MnistVectorFSQConfig:
     dim: int = 1024
     mlp_dim: int = 2048
 
-    inpaint_size: int = 8
+    inpaint_size: int = 10
 
-    latent_ndim: int = 10
-    latent_bins: int = 4
-    latent_group_size: int = 5
+    latent_ndim: int = 4
+    latent_bins: int = 8
 
-    cond_encoder_depth: int = 4
-    fsq_prior_blocks: int = 2
-    fsq_decoder_depth: int = 4
+    cond_mlp_depth: int = 2  # image (unmasked) -> cond
+    fsq_prior_depth: int = 2  # cond -> latent logits
+    fsq_encoder_depth: int = 2  # image (masked), cond -> latents
+    fsq_decoder_depth: int = 2  # latents, cond -> image (masked)
 
-    mse_weight_sigma: float = 0.05
+    mse_weight: float = 10.0
 
 
 @dataclass
 class Config:
     use_wandb: bool = False
-    savedir: str = str(Path(__file__).parent / "data/fsq_inpaint")
+    savedir: str = str(Path(__file__).parent / "data/fsqlite_inpaint")
 
     model: MnistVectorFSQConfig = field(default_factory=MnistVectorFSQConfig)
     do_compile: bool = False
@@ -59,64 +60,82 @@ class Config:
 
     muon_lr: float = 0.01
     muon_mu: float = 0.9
-    muon_wd: float = 0.03
-    scalar_lr: float = 0.0005
-    embeds_lr: float = 0.0005
-    output_lr: float = 0.0005
+    muon_wd: float = 0.01
+    scalar_lr: float = 0.0003
+    embeds_lr: float = 0.0003
+    output_lr: float = 0.0003
     adamw_mu1: float = 0.9
     adamw_mu2: float = 0.99
-    adamw_wd: float = 0.03
+    adamw_wd: float = 0.01
     lr_cooldown_start: int | None = None
     lr_cooldown_ratio: float = 0.0
 
 
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+    DTYPE = torch.bfloat16
+else:
+    DTYPE = torch.float32
+
+
 class FSQ(nn.Module):
-    def __init__(self, dim_in: int, ndim: int, bins: int):
+    def __init__(self, in_dim: int, ndim: int, bins: int):
         super().__init__()
         self.bins = bins
         self.in_proj = nn.Sequential(
-            RMSNorm(dim_in, affine=False),
-            FusedLinear(dim_in, ndim),
+            RMSNorm(in_dim, affine=False), FusedLinear(in_dim, ndim)
         )
 
     def forward(self, x):
-        z = torch.tanh(self.in_proj(x).float())  # in [-1, 1]
-        z = (z + 1.0) * ((self.bins - 1) / 2.0)  # [-1, 1] --> [0, nbins - 1]
-        idxs = torch.round(z.detach())
-        z = z + (idxs - z).detach()  # round w/ straight-through grad
-        z = z * (2.0 / (self.bins - 1)) - 1.0  # [0, nbins - 1] --> [-1, 1]
-        return z.type_as(x), idxs.type(torch.long)
+        latents = torch.tanh(self.in_proj(x).float())
+        # [-1, 1] --> [0, bins - 1]
+        latents_scaled = (latents + 1) * ((self.bins - 1) / 2)
+        ids = torch.round(latents_scaled.detach())
+        # Straight-through gradient estimator
+        ids_ste = latents_scaled + (ids - latents_scaled).detach()
+        # [0, bins - 1] --> [-1, 1]
+        latents_ste = ids_ste * (2 / (self.bins - 1)) - 1
+        return latents_ste.type_as(x), ids.long()
 
 
 class VectorModulatedMLP(nn.Module):
-    def __init__(self, dim, mlp_dim):
+    def __init__(self, dim: int, mlp_dim: int):
         super().__init__()
         self.norm = RMSNorm(dim, affine=False)
-        self.wx = FusedLinear(dim, mlp_dim)
-        self.wy = FusedLinear(dim, mlp_dim)
+        self.wk = FusedLinear(dim, mlp_dim)
+        self.wc = FusedLinear(dim, mlp_dim)
         self.act = nn.SiLU()
         self.wv = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
 
-    def forward(self, x, y):
-        scores = self.act(self.wx(self.norm(x)) * self.wy(self.norm(y)))
+    def forward(self, x, c):
+        scores = self.wk(self.norm(x))
+        scores = self.act(scores * self.wc(self.norm(c)))
         return self.wv(scores)
 
 
-class EmbedModulatedMLP(nn.Module):
-    def __init__(self, dim, mlp_dim, vocab_size: int):
+class VectorModulatedMLPStack(nn.Module):
+    def __init__(self, in_dim: int, dim: int, mlp_dim: int, depth: int):
         super().__init__()
-        self.norm = RMSNorm(dim, affine=False)
-        self.wq = FusedLinear(dim, mlp_dim)
-        self.k = make_embedding(vocab_size, mlp_dim)
-        self.act = nn.SiLU()
-        self.wv = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
+        self.in_proj = FusedLinear(in_dim, dim)
+        self.blocks = nn.ModuleList(
+            [VectorModulatedMLP(dim, mlp_dim) for _ in range(depth)]
+        )
 
-    def forward(self, x, ids):
-        scores = self.act(self.wq(self.norm(x)) * self.k(ids))
-        return self.wv(scores)
+    def forward(self, x, c):
+        x = self.in_proj(x)
+        for block in self.blocks:
+            x = x + block(x, c)
+        return x
 
 
-class VectorFSQ(nn.Module):
+def make_output_head(dim: int, out_dim: int):
+    head = nn.Sequential(
+        RMSNorm(dim, affine=False), FusedLinear(dim, out_dim, zero_init=True)
+    )
+    head[-1].weight._is_output = True
+    return head
+
+
+class VectorFSQLite(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -124,125 +143,76 @@ class VectorFSQ(nn.Module):
         data_dim: int,
         latent_ndim: int,
         latent_bins: int,
-        latent_group_size: int,
-        prior_blocks: int,
-        decoder_blocks: int,
+        prior_depth: int,
+        encoder_depth: int,
+        decoder_depth: int,
     ):
         super().__init__()
-        assert latent_ndim % latent_group_size == 0
+        self.dim = dim
+        self.data_dim = data_dim
         self.latent_ndim = latent_ndim
         self.latent_bins = latent_bins
-        self.latent_group_size = latent_group_size
-        self.ngroups = latent_ndim // latent_group_size
-        assert self.ngroups >= 1
+        self.vocab_size = latent_bins**latent_ndim
+        self.pad_vocab_size = ((self.vocab_size + 127) // 128) * 128
 
-        self.prior_mlp_blocks = nn.ModuleList(
+        self.encoder = VectorModulatedMLPStack(data_dim, dim, mlp_dim, encoder_depth)
+        self.prior_blocks = nn.ModuleList(
             [
                 nn.Sequential(
                     RMSNorm(dim, affine=False),
                     FusedLinear(dim, mlp_dim),
-                    nn.SiLU(),
+                    ReLU2(),
                     FusedLinear(mlp_dim, dim, scale=True, zero_init=True),
                 )
-                for _ in range(prior_blocks)
+                for _ in range(prior_depth)
             ]
         )
-
-        self.vocab_size = latent_bins**latent_group_size
-        self.prior_heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    RMSNorm(dim, affine=False),
-                    FusedLinear(dim, self.vocab_size, zero_init=True),
-                )
-                for _ in range(self.ngroups)
-            ]
-        )
-        for head in self.prior_heads:
-            head[-1]._is_output = True
-
-        self.prior_blocks = nn.ModuleList(
-            [
-                EmbedModulatedMLP(dim, mlp_dim, self.vocab_size)
-                for _ in range(self.ngroups - 1)
-            ]
-        )
-
-        self.encoder_in = FusedLinear(data_dim, dim)
-        self.encoder = VectorModulatedMLP(dim, mlp_dim)
-
+        self.prior_head = make_output_head(dim, self.pad_vocab_size)
+        self.fsq_norm = RMSNorm(dim, affine=False)
         self.fsq = FSQ(dim, latent_ndim, latent_bins)
-        self.fsq_out = FusedLinear(latent_ndim, dim)
+        self.decoder = VectorModulatedMLPStack(latent_ndim, dim, mlp_dim, decoder_depth)
+        self.decoder_head = make_output_head(dim, data_dim)
 
-        self.decoder_blocks = nn.ModuleList(
-            [VectorModulatedMLP(dim, mlp_dim) for _ in range(decoder_blocks)]
+        self._id_pows = nn.Buffer(
+            latent_bins ** torch.arange(latent_ndim), persistent=False
         )
-        self.decoder_head = nn.Sequential(
-            RMSNorm(dim, affine=False), FusedLinear(dim, data_dim, zero_init=True)
+
+    def prior(self, cond_ND):
+        c_ND = cond_ND
+        for block in self.prior_blocks:
+            c_ND = c_ND + block(c_ND)
+        logits_ND = self.prior_head(c_ND)[..., : self.vocab_size]
+        return logits_ND
+
+    def loss(self, data_ND, cond_ND):
+        assert data_ND.size(-1) == self.data_dim
+        assert cond_ND.size(-1) == self.dim
+
+        latents_NL, latent_bins_NL = self.fsq(
+            self.fsq_norm(self.encoder(data_ND, cond_ND))
         )
-        self.decoder_head._is_output = True
+        token_id_N = (latent_bins_NL * self._id_pows).sum(dim=-1)
 
-    def forward(self, x, y):
-        latents, raw_ids = self.fsq(self.encoder(x, self.encoder_in(y)))
-        assert raw_ids.size(-1) == self.ngroups * self.latent_group_size
-        group_ids = (
-            raw_ids.reshape(raw_ids.shape[:-1] + (self.ngroups, self.latent_group_size))
-            * (
-                self.latent_bins
-                ** torch.arange(self.latent_group_size, device=x.device)
-            )
-        ).sum(dim=-1)
-        assert group_ids.size(-1) == self.ngroups
-
-        h = x
-        for block in self.prior_mlp_blocks:
-            h = h + block(h)
-        logits = [self.prior_heads[0](h)]
-        for i, block in enumerate(self.prior_blocks):
-            h = h + block(h, group_ids[..., i])
-            logits.append(self.prior_heads[i + 1](h))
-        logits = torch.stack(logits, dim=-2)
-        xent = F.cross_entropy(logits.flatten(0, -2), group_ids.flatten())
-
-        yhat = self.fsq_out(latents * (3**0.5))
-        for block in self.decoder_blocks:
-            yhat = yhat + block(x, yhat)
-        yhat = self.decoder_head(yhat)
-
-        mse = (yhat - y).pow(2).mean()
-        return xent, mse
-
-    def generate(self, x):
-        group_ids = []
-
-        h = x
-        for block in self.prior_mlp_blocks:
-            h = h + block(h)
-        logits = self.prior_heads[0](h)
-        group_ids.append(Categorical(logits=logits).sample())
-        for i, block in enumerate(self.prior_blocks):
-            h = h + block(h, group_ids[-1])
-            logits = self.prior_heads[i + 1](h)
-            group_ids.append(Categorical(logits=logits).sample())
-        group_ids = torch.stack(group_ids, dim=-1)
-
-        assert group_ids.size(-1) == self.ngroups
-        raw_ids = torch.zeros(
-            group_ids.shape[:-1] + (self.ngroups, self.latent_group_size),
-            device=group_ids.device,
-            dtype=torch.long,
+        logits_ND = self.prior(cond_ND)
+        xent_N = F.cross_entropy(
+            logits_ND.flatten(0, -2), token_id_N.flatten(), reduction="none"
         )
-        for i in range(self.latent_group_size):
-            raw_ids[..., i] = group_ids % self.latent_bins
-            group_ids = group_ids // self.latent_bins
-        raw_ids = raw_ids.flatten(-2, -1)
-        assert raw_ids.size(-1) == self.latent_ndim
-        latents = raw_ids.type(DTYPE) * (2 / (self.latent_bins - 1)) - 1
-        yhat = self.fsq_out(latents * (3**0.5))
-        for block in self.decoder_blocks:
-            yhat = yhat + block(x, yhat)
-        yhat = self.decoder_head(yhat)
-        return yhat
+
+        # Multiply by sqrt(3) so uniform(-1, 1) --> variance 1.
+        reconstruction_ND = self.decoder(1.732 * latents_NL, cond_ND)
+        reconstruction_ND = self.decoder_head(reconstruction_ND)
+        mse_ND = (data_ND - reconstruction_ND).pow(2)
+        return xent_N, mse_ND
+
+    def generate(self, cond_ND):
+        logits_ND = self.prior(cond_ND)
+        token_id_N = Categorical(logits=logits_ND).sample()
+        latents_NL = (token_id_N.unsqueeze(-1) // self._id_pows) % self.latent_bins
+        latents_NL = latents_NL.type(DTYPE) * (2 / (self.latent_bins - 1)) - 1
+
+        reconstruction_ND = self.decoder(1.732 * latents_NL, cond_ND)
+        reconstruction_ND = self.decoder_head(reconstruction_ND)
+        return reconstruction_ND
 
 
 class MnistVectorFSQ(nn.Module):
@@ -251,6 +221,8 @@ class MnistVectorFSQ(nn.Module):
         self.cfg = cfg
         self.metrics = metrics
 
+        # Create a mask that, when applied to a (flattened) MNIST image, zeroes out
+        # a square in the center of size inpaint_size.
         xy = torch.arange(28 * 28)
         self.mask = nn.Buffer(
             ((xy // 28) < 14 - (cfg.inpaint_size // 2))
@@ -260,8 +232,8 @@ class MnistVectorFSQ(nn.Module):
             persistent=False,
         )
 
-        self.cond_encoder_in = FusedLinear(28 * 28, cfg.dim)
-        self.cond_encoder_blocks = nn.ModuleList(
+        self.cond_mlp_in = FusedLinear(28 * 28, cfg.dim)
+        self.cond_mlp_blocks = nn.ModuleList(
             [
                 nn.Sequential(
                     RMSNorm(cfg.dim, affine=False),
@@ -269,18 +241,18 @@ class MnistVectorFSQ(nn.Module):
                     nn.SiLU(),
                     FusedLinear(cfg.mlp_dim, cfg.dim),
                 )
-                for _ in range(cfg.cond_encoder_depth)
+                for _ in range(cfg.cond_mlp_depth)
             ]
         )
-        self.vector_fsq = VectorFSQ(
+        self.vector_fsq = VectorFSQLite(
             cfg.dim,
             cfg.mlp_dim,
             data_dim=self.cfg.inpaint_size**2,
             latent_ndim=cfg.latent_ndim,
             latent_bins=cfg.latent_bins,
-            latent_group_size=cfg.latent_group_size,
-            prior_blocks=cfg.fsq_prior_blocks,
-            decoder_blocks=cfg.fsq_decoder_depth,
+            prior_depth=cfg.fsq_prior_depth,
+            encoder_depth=cfg.fsq_encoder_depth,
+            decoder_depth=cfg.fsq_decoder_depth,
         )
 
     def forward(self, images, labels):
@@ -288,31 +260,34 @@ class MnistVectorFSQ(nn.Module):
         images = images.type(DTYPE) / 255.0
         images = images.flatten(1, -1)
         images = (images - self.cfg.img_mean) / self.cfg.img_std
-        cond = images * self.mask
+        unmasked_img = images * self.mask
         assert images.size(-1) == 28 * 28
         lo = 14 - self.cfg.inpaint_size // 2
         hi = 14 + self.cfg.inpaint_size // 2
-        y = images.reshape(N, 28, 28)[:, lo:hi, lo:hi].reshape(
+        masked_img = images.reshape(N, 28, 28)[:, lo:hi, lo:hi].reshape(
             N, self.cfg.inpaint_size**2
         )
 
-        x = self.cond_encoder_in(cond)
-        for block in self.cond_encoder_blocks:
-            x = x + block(x)
+        cond = self.cond_mlp_in(unmasked_img)
+        for block in self.cond_mlp_blocks:
+            cond = cond + block(cond)
 
-        xent, mse = self.vector_fsq(x, y)
-        loss = xent + mse / self.cfg.mse_weight_sigma
-        self.metrics.push(xent=xent, mse=mse, loss=loss)
+        xent, mse = self.vector_fsq.loss(masked_img, cond)
+        loss = xent.mean() + self.cfg.mse_weight * mse.mean()
+        self.metrics.push(xent=xent.mean(), mse=mse.mean(), loss=loss)
         return loss
 
     def generate(self, images):
         images = images.type(DTYPE) / 255.0
         images = images.flatten(1, -1)
         images = (images - self.cfg.img_mean) / self.cfg.img_std
-        cond = images * self.mask
-        x = self.cond_encoder_in(cond)
-        y = self.vector_fsq.generate(x)
-        return y
+        unmasked_img = images * self.mask
+        cond = self.cond_mlp_in(unmasked_img)
+        for block in self.cond_mlp_blocks:
+            cond = cond + block(cond)
+
+        masked_img_pred = self.vector_fsq.generate(cond)
+        return masked_img_pred
 
 
 class Trainer:
