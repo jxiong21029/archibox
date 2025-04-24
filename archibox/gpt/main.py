@@ -1,6 +1,5 @@
 import argparse
 import logging
-import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,13 +20,13 @@ from archibox.metrics import Metrics
 from archibox.muon import Muon
 
 log = logging.getLogger(__name__)
-flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune")
+flex_attention = torch.compile(flex_attention, dynamic=False)
 
 
 @dataclass
 class Config:
     n_steps: int = 2000
-    seq_len: int = 4 * 1024  # gpu poor moment
+    seq_len: int = 4 * 1024
     seq_len_valid: int = 4 * 1024
     valid_every: int = 125
     valid_tokens: int = 10 * 1024 * 1024
@@ -36,57 +35,65 @@ class Config:
     depth: int = 12
     vocab_size: int = 50257
 
-    muon_lr: float = 0.05
+    muon_lr: float = 0.03
     muon_mu: float = 0.95
-    muon_wd: float = 0.05
+    muon_wd: float = 0.01
     scalar_lr: float = 0.003
     embeds_lr: float = 0.003
     output_lr: float = 0.003
     adamw_mu1: float = 0.95
     adamw_mu2: float = 0.99
-    adamw_wd: float = 0.05
+    adamw_wd: float = 0.01
     lr_cooldown_start: int = 1200
     lr_cooldown_ratio: float = 0.1
+
+
+# TODO: value residuals
+# Temporary experiment stuff...
+MLP_ACTIVATION = ReLU2
 
 
 class DecoderLayer(nn.Module):
     def __init__(
         self,
         dim: int,
+        head_dim: int,
+        mlp_dim: int,
         seq_len: int,
         window_size: int,
-        rotary_base: float,
-        head_dim: int,
-        mlp_mult: float,
+        use_rope: bool,
+        rope_base: float,
+        resid_scale: bool,
     ):
         assert head_dim % 4 == 0
         super().__init__()
         self.dim = dim
+        self.head_dim = head_dim
+        self.nheads = dim // head_dim
         self.seq_len = seq_len  # training sequence length
         self.window_size = window_size  # max number of tokens to attend to
-        self.rotary_base = rotary_base  # maximum period of rotary / 2pi
-        self.nheads = dim // head_dim
-        self.head_dim = head_dim
+        self.use_rope = use_rope  # whether to apply rotary positional embeddings
+        self.rope_base = rope_base  # maximum period of rope / 2pi
 
         self.attn_norm = RMSNorm(dim, affine=False)
-        self.qkv_w = nn.Parameter(torch.randn(3, dim, dim).fmod(2) / math.sqrt(dim) / 2)
+        self.qkv_w = nn.Parameter(torch.randn(3, dim, dim) / dim**0.5 / 2)
         self.qk_norm = RMSNorm(head_dim, affine=False)
-        self.o_proj = FusedLinear(dim, dim, scale=True)
-        self.o_proj.scale.data.zero_()
+        self.o_proj = FusedLinear(dim, dim, scale=resid_scale, zero_init=True)
 
-        freqs = (1 / rotary_base) ** torch.linspace(
-            0, 1, head_dim // 4, dtype=torch.float32
-        )
-        # Used during inference
-        self.freqs_d = nn.Buffer(
-            torch.cat((freqs, freqs.new_zeros(head_dim // 4))), persistent=False
-        )
-        theta_1T1d = torch.outer(torch.arange(seq_len), self.freqs_d).reshape(
-            1, seq_len, 1, head_dim // 2
-        )
-        # Used during training
-        self.cos_1T1d = nn.Buffer(torch.cos(theta_1T1d), persistent=False)
-        self.sin_1T1d = nn.Buffer(torch.sin(theta_1T1d), persistent=False)
+        if use_rope:
+            freqs = (1 / rope_base) ** torch.linspace(
+                0, 1, head_dim // 4, dtype=torch.float32
+            )
+            # Used during inference
+            self.freqs_d = nn.Buffer(
+                torch.cat((freqs, freqs.new_zeros(head_dim // 4))), persistent=False
+            )
+            theta_1T1d = torch.outer(torch.arange(seq_len), self.freqs_d).reshape(
+                1, seq_len, 1, head_dim // 2
+            )
+            # Used during training
+            self.cos_1T1d = nn.Buffer(torch.cos(theta_1T1d), persistent=False)
+            self.sin_1T1d = nn.Buffer(torch.sin(theta_1T1d), persistent=False)
 
         def sliding_window_causal(b, h, q_idx, kv_idx):
             return (kv_idx <= q_idx) & (q_idx < kv_idx + window_size)
@@ -97,11 +104,10 @@ class DecoderLayer(nn.Module):
 
         self.mlp = nn.Sequential(
             RMSNorm(dim, affine=False),
-            FusedLinear(dim, round(mlp_mult * dim)),
-            ReLU2(),
-            FusedLinear(round(mlp_mult * dim), dim, scale=True),
+            FusedLinear(dim, mlp_dim),
+            MLP_ACTIVATION(),
+            FusedLinear(mlp_dim, dim, scale=resid_scale, zero_init=True),
         )
-        self.mlp[-1].scale.data.zero_()
 
     def rotary(self, x_NTHD):
         """Training rotary embedding (known seq_len, cached cos/sin)"""
@@ -127,11 +133,12 @@ class DecoderLayer(nn.Module):
     def forward(self, x_NTD: Tensor):
         """Training forward (fixed seq_len, no past_kv)"""
         N, T, _ = x_NTD.shape
-        residual = x_NTD
+        input_NTD = x_NTD
         qkv = self.attn_norm(x_NTD) @ self.qkv_w.flatten(0, 1).type_as(x_NTD).t()
         q_NTHD, k_NTHD, v_NTHD = qkv.view(N, T, 3 * self.nheads, -1).chunk(3, dim=2)
         q_NTHD, k_NTHD = self.qk_norm(q_NTHD), self.qk_norm(k_NTHD)
-        q_NTHD, k_NTHD = self.rotary(q_NTHD), self.rotary(k_NTHD)
+        if self.use_rope:
+            q_NTHD, k_NTHD = self.rotary(q_NTHD), self.rotary(k_NTHD)
         x_NHTD = flex_attention(
             q_NTHD.transpose(1, 2),
             k_NTHD.transpose(1, 2),
@@ -139,20 +146,28 @@ class DecoderLayer(nn.Module):
             block_mask=self.block_mask,
         )
         x_NTD = x_NHTD.transpose(1, 2).reshape(N, T, self.dim)
-        x_NTD = residual + self.o_proj(x_NTD)
+        x_NTD = input_NTD + self.o_proj(x_NTD)
 
         x_NTD = x_NTD + self.mlp(x_NTD)
         return x_NTD
 
-    def predict(self, x_ND: Tensor, past_kv: tuple[Tensor, Tensor] | None, t: int):
+    def predict(
+        self, x_ND: Tensor, past_kv: tuple[Tensor, Tensor] | None, t: int | None = None
+    ):
         """Inference (one input token, optional past_kv). Returns new kv."""
         N, _ = x_ND.shape
-        residual = x_ND
+        input_ND = x_ND
         qkv = self.attn_norm(x_ND) @ self.qkv_w.flatten(0, 1).type_as(x_ND).t()
         q_NHD, k_NHD, v_NHD = qkv.view(N, 3 * self.nheads, -1).chunk(3, dim=1)
         q_NHD, k_NHD = self.qk_norm(q_NHD), self.qk_norm(k_NHD)
-        q_NHD = self.inference_rotary(q_NHD, t)
-        k_NHD = self.inference_rotary(k_NHD, t)
+
+        if self.use_rope:
+            assert t is not None
+            q_NHD = self.inference_rotary(q_NHD, t)
+            k_NHD = self.inference_rotary(k_NHD, t)
+        else:
+            assert t is None
+
         if past_kv is not None:
             past_k_NHTD, past_v_NHTD = past_kv
             k_NHTD = torch.cat([past_k_NHTD, k_NHD.unsqueeze(2)], dim=2)
@@ -162,7 +177,7 @@ class DecoderLayer(nn.Module):
             v_NHTD = v_NHD.unsqueeze(2)
         x_NHTD = F.scaled_dot_product_attention(q_NHD.unsqueeze(2), k_NHTD, v_NHTD)
         x_ND = x_NHTD[:, :, -1, :].flatten(1, 2)
-        x_ND = residual + self.o_proj(x_ND)
+        x_ND = input_ND + self.o_proj(x_ND)
 
         x_ND = x_ND + self.mlp(x_ND)
         return x_ND, (
@@ -175,23 +190,27 @@ class Decoder(nn.Module):
     def __init__(
         self,
         dim: int,
+        head_dim: int,
+        mlp_dim: int,
         depth: int,
         seq_len: int,
         window_size: int,
-        head_dim: int = 64,
-        mlp_mult: float = 4.0,
-        rotary_base: float = 1024.0,
+        use_rope: bool,
+        rope_base: float,
+        resid_scale: bool,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(
                     dim=dim,
+                    head_dim=head_dim,
+                    mlp_dim=mlp_dim,
                     seq_len=seq_len,
                     window_size=window_size,
-                    rotary_base=rotary_base,
-                    head_dim=head_dim,
-                    mlp_mult=mlp_mult,
+                    use_rope=use_rope,
+                    rope_base=rope_base,
+                    resid_scale=resid_scale,
                 )
                 for _ in range(depth)
             ]
@@ -203,7 +222,12 @@ class Decoder(nn.Module):
             x_NTD = layer(x_NTD)
         return x_NTD
 
-    def predict(self, x: Tensor, kv_cache: list[tuple[Tensor, Tensor]] | None, t: int):
+    def predict(
+        self,
+        x: Tensor,
+        kv_cache: list[tuple[Tensor, Tensor]] | None,
+        t: int | None = None,
+    ):
         """Inference (one input token, optional kv_cache). Returns new kv_cache"""
         if kv_cache is None:
             kv_cache = [None for _ in range(len(self.layers))]
@@ -216,15 +240,33 @@ class Decoder(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, dim: int, depth: int, vocab_size: int):
+    def __init__(
+        self,
+        dim: int,
+        mlp_dim: int,
+        depth: int,
+        seq_len: int,
+        window_size: int,
+        vocab_size: int,
+    ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.embed.weight.data.mul_(0.5)
 
         self.vocab_size = vocab_size
-        self.decoder = Decoder(dim, depth)
+        self.decoder = Decoder(
+            dim=dim,
+            head_dim=64,
+            mlp_dim=mlp_dim,
+            depth=depth,
+            seq_len=seq_len,
+            window_size=window_size,
+            use_rope=True,
+            rope_base=1024.0,
+            resid_scale=True,
+        )
 
-        out_dim = (vocab_size + 63) // 64 * 64
+        out_dim = (vocab_size + 127) // 128 * 128
         self.lm_head = FusedLinear(dim, out_dim, scale=True)
         self.lm_head.scale.data.zero_()
 
