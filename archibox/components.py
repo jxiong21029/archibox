@@ -43,16 +43,17 @@ class FusedLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        bias=False,
-        scale=False,
-        zero_init=False,
+        bias: bool = False,
+        scale: bool = False,
+        zero_init: bool = False,
+        gain: float = 0.5,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
         self.weight = nn.Parameter(
-            torch.randn(out_features, in_features) / math.sqrt(in_features) / 2
+            torch.randn(out_features, in_features) / math.sqrt(in_features) * gain
         )
 
         if bias:

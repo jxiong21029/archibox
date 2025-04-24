@@ -11,7 +11,7 @@ import tqdm
 from einops import rearrange
 from PIL import Image
 
-from archibox.components import FusedLinear, RMSNorm
+from archibox.components import RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.muon import Muon
@@ -25,37 +25,39 @@ else:
 
 @dataclass
 class FlowConfig:
-    dim: int = 768
-    mlp_dim: int = 3072
-    embed_dim: int = 128
-    cond_dim: int = 256
+    dim: int = 1024
+    mlp_dim: int = 2048
     depth: int = 2
+    weight_norm: bool = True
+    scale: bool = True
+    scale_output: bool = True
 
     img_mean: float = 0.1307
     img_std: float = 0.3081
-    use_trigflow: bool = False
+
+    use_trigflow: bool = True
 
 
 @dataclass
 class Config:
     use_wandb: bool = False
-    savedir: str = str(Path(__file__).parent / "data/flow_v2")
+    savedir: str = str(Path(__file__).parent / "data/flow_v3")
 
     model: FlowConfig = field(default_factory=FlowConfig)
     do_compile: bool = False
-    n_steps: int = 5_000
+    n_steps: int = 1_000
     valid_every: int | None = 1000
     batch_size: int = 8192
 
     muon_lr: float = 0.02
     muon_mu: float = 0.9
-    muon_wd: float = 0.01
-    scalar_lr: float = 0.001
-    embeds_lr: float = 0.001
-    output_lr: float = 0.001
+    muon_wd: float = 0.0
+    scalar_lr: float = 0.01
+    embeds_lr: float = 0.003
+    output_lr: float = 0.003
     adamw_mu1: float = 0.9
     adamw_mu2: float = 0.99
-    adamw_wd: float = 0.01
+    adamw_wd: float = 0.0
     lr_cooldown_start: int | None = None
     lr_cooldown_ratio: float = 0.0
 
@@ -68,19 +70,71 @@ def make_embedding(num_embeddings: int, embedding_dim: int):
     return embed
 
 
+class FusedLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        weight_norm=False,
+        scale=False,
+        zero_init=False,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_norm = weight_norm
+
+        self.weight = nn.Parameter(
+            torch.randn(out_features, in_features) / in_features**0.5 / 2
+        )
+        if weight_norm:
+            weight = self.weight.float()
+            weight = weight / weight.pow(2).sum(dim=1, keepdim=True).add(1e-7).sqrt()
+            self.weight.data.copy_(weight)
+
+        if scale:
+            self.scale = nn.Parameter(torch.ones(out_features))
+            if zero_init:
+                self.scale.data.zero_()
+        else:
+            self.register_parameter("scale", None)
+            if zero_init:
+                if weight_norm:
+                    log.warning(
+                        "zero-init with weight normalization and w/o learnable scaling "
+                        "is not recommended."
+                    )
+                self.weight.data.zero_()
+
+    def forward(self, x):
+        if self.weight_norm:
+            weight = self.weight.float()
+            weight = weight / weight.pow(2).sum(dim=1, keepdim=True).add(1e-7).sqrt()
+            if self.training:
+                self.weight.data.copy_(weight)
+        else:
+            weight = self.weight
+
+        if self.scale is not None:
+            weight = weight * self.scale.unsqueeze(1)
+
+        return x @ weight.type_as(x).t()
+
+
 class ModulatedMLP(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int, cond_dim: int):
+    def __init__(self, dim: int, mlp_dim: int, weight_norm: bool, scale: bool):
         super().__init__()
         self.norm = RMSNorm(dim, affine=False)
-        self.wk = FusedLinear(dim, mlp_dim)
-        self.wc = FusedLinear(cond_dim, mlp_dim)
+        self.wx = FusedLinear(dim, mlp_dim, weight_norm=weight_norm, scale=scale)
+        self.wc = FusedLinear(dim, mlp_dim, weight_norm=weight_norm)
         self.act = nn.SiLU()
-        self.wv = FusedLinear(mlp_dim, dim, zero_init=True)
+        self.wv = FusedLinear(
+            mlp_dim, dim, weight_norm=weight_norm, scale=scale, zero_init=True
+        )
 
     def forward(self, x, c):
-        scores = self.wk(self.norm(x))
-        scores = self.act(scores * (1 + self.wc(c)))
-        return x + self.wv(scores)
+        scores = self.wx(self.norm(x)) * self.wc(self.norm(c))
+        return self.wv(self.act(scores))
 
 
 class VectorFlow(nn.Module):
@@ -89,38 +143,49 @@ class VectorFlow(nn.Module):
         dim: int,
         mlp_dim: int,
         data_dim: int,
-        cond_dim: int,
         depth: int,
-        use_trigflow: bool = False,
+        weight_norm: bool,
+        scale: bool,
+        scale_output: bool,
+        use_trigflow: bool,
     ):
         super().__init__()
         self.dim = dim
         self.mlp_dim = mlp_dim
         self.data_dim = data_dim
-        self.cond_dim = cond_dim
         self.use_trigflow = use_trigflow
 
-        self.in_proj = FusedLinear(data_dim, dim)
-        self.t_proj = FusedLinear(cond_dim, cond_dim)
+        self.in_proj = FusedLinear(data_dim, dim, weight_norm=weight_norm, scale=scale)
+        self.t_proj = FusedLinear(256, dim, weight_norm=weight_norm, scale=scale)
         self.blocks = nn.ModuleList(
-            [ModulatedMLP(dim, mlp_dim, cond_dim=cond_dim) for _ in range(depth)]
+            [
+                ModulatedMLP(dim, mlp_dim, weight_norm=weight_norm, scale=scale)
+                for _ in range(depth)
+            ]
         )
         self.out_head = nn.Sequential(
-            RMSNorm(dim, affine=False), FusedLinear(dim, data_dim, zero_init=True)
+            RMSNorm(dim, affine=False),
+            FusedLinear(
+                dim,
+                data_dim,
+                weight_norm=weight_norm,
+                scale=scale_output,
+                zero_init=True,
+            ),
         )
         self.out_head[-1].weight._is_output = True
 
     def time_embed(self, t, freq_lo=1.0, freq_hi=16.0):
         assert t.size(-1) == 1
         freqs_D = freq_lo * (
-            freq_hi ** torch.linspace(0, 1, self.cond_dim // 2, device=t.device).float()
+            freq_hi ** torch.linspace(0, 1, 256 // 2, device=t.device).float()
         )
         theta_ND = t.float() * freqs_D
         return torch.cat([theta_ND.sin(), theta_ND.cos()], dim=-1)
 
     def forward(self, inputs, cond):
         assert inputs.size(-1) == self.data_dim
-        assert cond.size(-1) == self.cond_dim
+        assert cond.size(-1) == self.dim
         device, dtype = inputs.device, inputs.dtype
 
         x1 = inputs.float()
@@ -139,7 +204,7 @@ class VectorFlow(nn.Module):
 
         h = self.in_proj(xt.type(dtype))
         for block in self.blocks:
-            h = block(h, cond + t_emb)
+            h = h + block(h, cond + t_emb)
         pt = self.out_head(h).type_as(vt)
 
         loss = (pt - vt).pow(2)
@@ -148,7 +213,7 @@ class VectorFlow(nn.Module):
     def step(self, xt, c):
         h = self.in_proj(xt)
         for block in self.blocks:
-            h = block(h, c)
+            h = h + block(h, c)
         return self.out_head(h).float()
 
     @torch.no_grad
@@ -181,11 +246,13 @@ class MnistFlow(nn.Module):
             cfg.dim,
             cfg.mlp_dim,
             data_dim=28 * 28,
-            cond_dim=cfg.cond_dim,
             depth=cfg.depth,
+            weight_norm=cfg.weight_norm,
+            scale=cfg.scale,
+            scale_output=cfg.scale_output,
             use_trigflow=cfg.use_trigflow,
         )
-        self.class_embed = make_embedding(10, cfg.cond_dim)
+        self.class_embed = make_embedding(10, cfg.dim)
 
     def forward(self, images_NHW, labels_N):
         images_N1HW = images_NHW.type(DTYPE) / 255.0
@@ -399,7 +466,16 @@ class Trainer:
         distance = np.abs(fracs - ref_fracs).mean()
         self.metrics.push(pixel_counts_distance=distance)
 
-        self.metrics.report()
+        results = {}
+        for k in self.metrics.n:
+            if self.metrics.n[k] == 0:
+                continue
+            if isinstance(self.metrics.mean[k], torch.Tensor):
+                results[k] = self.metrics.mean[k].to("cpu", non_blocking=True)
+            else:
+                results[k] = self.metrics.mean[k]
+        log.info(str(results))
+
         self.model.train()
         self.metrics.context = "train_"
 
