@@ -26,16 +26,14 @@ else:
 @dataclass
 class FlowConfig:
     dim: int = 1024
-    mlp_dim: int = 4096
+    mlp_dim: int = 2048
     freq_dim: int = 1024
     min_freq: float = 2 * torch.pi
     max_freq: float = 200 * torch.pi
-    depth: int = 2
+    depth: int = 4
 
     img_mean: float = 0.5
     img_std: float = 0.5
-
-    use_trigflow: bool = True
 
 
 @dataclass
