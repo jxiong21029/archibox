@@ -11,7 +11,7 @@ import tqdm
 from einops import rearrange
 from PIL import Image
 
-from archibox.components import RMSNorm
+from archibox.components import FusedLinear, RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.muon import Muon
@@ -26,11 +26,11 @@ else:
 @dataclass
 class FlowConfig:
     dim: int = 1024
-    mlp_dim: int = 2048
+    mlp_dim: int = 4096
+    freq_dim: int = 1024
+    min_freq: float = 2 * torch.pi
+    max_freq: float = 200 * torch.pi
     depth: int = 2
-    weight_norm: bool = True
-    scale: bool = True
-    scale_output: bool = True
 
     img_mean: float = 0.5
     img_std: float = 0.5
@@ -41,7 +41,7 @@ class FlowConfig:
 @dataclass
 class Config:
     use_wandb: bool = False
-    savedir: str = str(Path(__file__).parent / "data/flow_v3")
+    savedir: str = str(Path(__file__).parent / "data/flow_simple")
 
     model: FlowConfig = field(default_factory=FlowConfig)
     do_compile: bool = False
@@ -49,15 +49,10 @@ class Config:
     valid_every: int | None = 1000
     batch_size: int = 8192
 
-    muon_lr: float = 0.01
-    muon_mu: float = 0.9
-    muon_wd: float = 0.0
-    scalar_lr: float = 0.0003
-    embeds_lr: float = 0.0003
-    output_lr: float = 0.0003
-    adamw_mu1: float = 0.9
-    adamw_mu2: float = 0.99
-    adamw_wd: float = 0.0
+    use_muon: bool = True
+    muon_lr: float = 0.02
+    adamw_lr: float = 0.003
+    wd: float = 0.01
     lr_cooldown_start: int | None = None
     lr_cooldown_ratio: float = 0.0
 
@@ -70,71 +65,19 @@ def make_embedding(num_embeddings: int, embedding_dim: int):
     return embed
 
 
-class FusedLinear(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        weight_norm=False,
-        scale=False,
-        zero_init=False,
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight_norm = weight_norm
-
-        self.weight = nn.Parameter(
-            torch.randn(out_features, in_features) / in_features**0.5 / 2
-        )
-        if weight_norm:
-            weight = self.weight.float()
-            weight = weight / weight.pow(2).sum(dim=1, keepdim=True).add(1e-7).sqrt()
-            self.weight.data.copy_(weight)
-
-        if scale:
-            self.scale = nn.Parameter(torch.ones(out_features))
-            if zero_init:
-                self.scale.data.zero_()
-        else:
-            self.register_parameter("scale", None)
-            if zero_init:
-                if weight_norm:
-                    log.warning(
-                        "zero-init with weight normalization and w/o learnable scaling "
-                        "is not recommended."
-                    )
-                self.weight.data.zero_()
-
-    def forward(self, x):
-        if self.weight_norm:
-            weight = self.weight.float()
-            weight = weight / weight.pow(2).sum(dim=1, keepdim=True).add(1e-7).sqrt()
-            if self.training:
-                self.weight.data.copy_(weight)
-        else:
-            weight = self.weight
-
-        if self.scale is not None:
-            weight = weight * self.scale.unsqueeze(1)
-
-        return x @ weight.type_as(x).t()
-
-
-class ModulatedMLP(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int, weight_norm: bool, scale: bool):
+class ConditionalMLPBlock(nn.Module):
+    def __init__(self, dim: int, mlp_dim: int):
         super().__init__()
         self.norm = RMSNorm(dim, affine=False)
-        self.wx = FusedLinear(dim, mlp_dim, weight_norm=weight_norm, scale=scale)
-        self.wc = FusedLinear(dim, mlp_dim, weight_norm=weight_norm)
+        self.k = FusedLinear(dim, mlp_dim)
+        self.wc = FusedLinear(dim, mlp_dim, scale=True, zero_init=True)
         self.act = nn.SiLU()
-        self.wv = FusedLinear(
-            mlp_dim, dim, weight_norm=weight_norm, scale=scale, zero_init=True
-        )
+        self.v = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
 
     def forward(self, x, c):
-        scores = self.wx(self.norm(x)) * self.wc(self.norm(c))
-        return self.wv(self.act(scores))
+        scores = self.act(self.k(self.norm(x)))
+        scores = scores * (1 + self.wc(self.norm(c)))
+        return self.v(scores)
 
 
 class VectorFlow(nn.Module):
@@ -143,74 +86,58 @@ class VectorFlow(nn.Module):
         dim: int,
         mlp_dim: int,
         data_dim: int,
+        freq_dim: int,
         depth: int,
-        weight_norm: bool,
-        scale: bool,
-        scale_output: bool,
-        use_trigflow: bool,
+        min_freq: float,
+        max_freq: float,
     ):
         super().__init__()
         self.dim = dim
         self.mlp_dim = mlp_dim
         self.data_dim = data_dim
-        self.use_trigflow = use_trigflow
+        self.freq_dim = freq_dim
+        self.min_freq = min_freq
+        self.max_mult = max_freq / min_freq
 
-        self.in_proj = FusedLinear(data_dim, dim, weight_norm=weight_norm, scale=scale)
-        self.t_proj = FusedLinear(256, dim, weight_norm=weight_norm, scale=scale)
+        self.in_proj = FusedLinear(data_dim, dim)
+        self.t_proj = FusedLinear(freq_dim * 2, dim)
         self.blocks = nn.ModuleList(
-            [
-                ModulatedMLP(dim, mlp_dim, weight_norm=weight_norm, scale=scale)
-                for _ in range(depth)
-            ]
+            [ConditionalMLPBlock(dim, mlp_dim) for _ in range(depth)]
         )
         self.out_head = nn.Sequential(
-            RMSNorm(dim, affine=False),
-            FusedLinear(
-                dim,
-                data_dim,
-                weight_norm=weight_norm,
-                scale=scale_output,
-                zero_init=True,
-            ),
+            RMSNorm(dim, affine=False), FusedLinear(dim, data_dim, zero_init=True)
         )
         self.out_head[-1].weight._is_output = True
 
-    def time_embed(self, t, freq_lo=1.0, freq_hi=16.0):
+    def time_embed(self, t):
         assert t.size(-1) == 1
-        freqs_D = freq_lo * (
-            freq_hi ** torch.linspace(0, 1, 256 // 2, device=t.device).float()
+        freqs = self.min_freq * (
+            self.max_mult ** torch.linspace(0, 1, self.freq_dim, device=t.device)
         )
-        theta_ND = t.float() * freqs_D
-        return torch.cat([theta_ND.sin(), theta_ND.cos()], dim=-1)
+        thetas = t.float() * freqs.float()
+        return torch.cat([thetas.sin(), thetas.cos()], dim=-1)
 
-    def forward(self, inputs, cond):
+    def loss(self, inputs, cond):
         assert inputs.size(-1) == self.data_dim
         assert cond.size(-1) == self.dim
         device, dtype = inputs.device, inputs.dtype
 
         x1 = inputs.float()
         t = torch.sigmoid(torch.randn(inputs.shape[:-1] + (1,), device=device))
-        # t = torch.rand(inputs.shape[:-1] + (1,), device=device)
         t_emb = self.t_proj(self.time_embed(t).type(dtype))
 
         x0 = torch.randn_like(x1)
-        if self.use_trigflow:
-            theta = t * (torch.pi / 2)
-            xt = torch.cos(theta) * x0 + torch.sin(theta) * x1
-            vt = (torch.cos(theta) * x1 - torch.sin(theta) * x0) * (torch.pi / 2)
-        else:
-            xt = (1 - t) * x0 + t * x1
-            vt = x1 - x0
+        s = t * (torch.pi / 2)
+        xt = torch.cos(s) * x0 + torch.sin(s) * x1
+        vt = (-torch.sin(s) * x0 + torch.cos(s) * x1) * (torch.pi / 2)
 
-        h = self.in_proj(xt.type(dtype))
-        for block in self.blocks:
-            h = h + block(h, cond + t_emb)
-        pt = self.out_head(h).type_as(vt)
+        c = t_emb + cond
+        pt = self(xt.type(dtype), c)
 
         loss = (pt - vt).pow(2)
         return loss
 
-    def step(self, xt, c):
+    def forward(self, xt, c):
         h = self.in_proj(xt)
         for block in self.blocks:
             h = h + block(h, c)
@@ -229,9 +156,9 @@ class VectorFlow(nn.Module):
             t_start_emb = self.t_proj(self.time_embed(t_start).type(dtype))
             t_stop_emb = self.t_proj(self.time_embed(t_stop).type(dtype))
 
-            v_start = self.step(xt.type(dtype), cond + t_start_emb)
+            v_start = self(xt.type(dtype), cond + t_start_emb)
             xt_stop = xt + (t_stop - t_start) * v_start
-            v_stop = self.step(xt_stop.type(dtype), cond + t_stop_emb)
+            v_stop = self(xt_stop.type(dtype), cond + t_stop_emb)
 
             xt = xt + (t_stop - t_start) * (v_start + v_stop) / 2
         return xt
@@ -243,14 +170,13 @@ class MnistFlow(nn.Module):
         self.cfg = cfg
         self.metrics = metrics
         self.flow = VectorFlow(
-            cfg.dim,
-            cfg.mlp_dim,
+            dim=cfg.dim,
+            mlp_dim=cfg.mlp_dim,
             data_dim=28 * 28,
+            freq_dim=cfg.freq_dim,
             depth=cfg.depth,
-            weight_norm=cfg.weight_norm,
-            scale=cfg.scale,
-            scale_output=cfg.scale_output,
-            use_trigflow=cfg.use_trigflow,
+            min_freq=cfg.min_freq,
+            max_freq=cfg.max_freq,
         )
         self.class_embed = make_embedding(10, cfg.dim)
 
@@ -261,7 +187,7 @@ class MnistFlow(nn.Module):
 
         class_emb_ND = self.class_embed(labels_N).type(DTYPE)
 
-        loss = self.flow(imgs_ND, class_emb_ND).mean()
+        loss = self.flow.loss(imgs_ND, class_emb_ND).mean()
         self.metrics.push(loss=loss)
         return loss
 
@@ -302,80 +228,63 @@ class Trainer:
         if cfg.do_compile:
             self.model = torch.compile(self.model)
 
-        scalar_params = []
-        embeds_params = []
-        output_params = []
         muon_params = []
+        adamw_params = []
         for name, p in self.model.named_parameters():
             shape = tuple(p.shape)
             if not p.requires_grad:
-                self.debug_once(f"{name} {shape} requires_grad=False, skipped")
+                self.log_once(
+                    f"{name} {shape} requires_grad=False, skipped", logging.DEBUG
+                )
                 continue
-            elif p.ndim < 2:
-                self.debug_once(f"{name} {shape} assigned to AdamW")
-                scalar_params.append(p)
-            elif hasattr(p, "_is_embed") and p._is_embed:
-                self.debug_once(f"{name} {shape} (_is_embed=True) assigned to AdamW")
-                embeds_params.append(p)
-            elif hasattr(p, "_is_output") and p._is_output:
-                self.debug_once(f"{name} {shape} (_is_output=True) assigned to AdamW")
-                output_params.append(p)
+            elif (
+                p.ndim < 2
+                or not cfg.use_muon
+                or (hasattr(p, "_is_embed") and p._is_embed)
+                or (hasattr(p, "_is_output") and p._is_output)
+            ):
+                self.log_once(f"{name} {shape} assigned to AdamW", logging.DEBUG)
+                adamw_params.append(p)
             else:
-                if hasattr(p, "_ortho") and self.is_main_process:
-                    log.warning(
-                        "_ortho is deprecated, use _is_embed or _is_output instead"
-                    )
-                self.debug_once(f"{name}{shape} assigned to Muon")
+                self.log_once(f"{name} {shape} assigned to Muon", logging.DEBUG)
                 muon_params.append(p)
+
         if self.is_main_process:
-            total_params = sum(
-                p.numel()
-                for p in muon_params + scalar_params + embeds_params + output_params
-            )
+            total_params = sum(p.numel() for p in muon_params + adamw_params)
             total_param_tensors = sum(
-                len(group)
-                for group in (muon_params, scalar_params, embeds_params, output_params)
+                len(group) for group in (muon_params, adamw_params)
             )
             log.info(
                 "parameter information:\n"
                 f"- muon params: {sum(p.numel() for p in muon_params):,} over {len(muon_params):,} tensors\n"
-                f"- scalar params: {sum(p.numel() for p in scalar_params):,} over {len(scalar_params):,} tensors\n"
-                f"- embeds params: {sum(p.numel() for p in embeds_params):,} over {len(embeds_params):,} tensors\n"
-                f"- output params: {sum(p.numel() for p in output_params):,} over {len(output_params):,} tensors\n"
+                f"- adamw params: {sum(p.numel() for p in adamw_params):,} over {len(adamw_params):,} tensors\n"
                 f"total: {total_params:,} over {total_param_tensors:,} tensors"
             )
-        adamw_params = [
-            dict(params=scalar_params, lr=self.cfg.scalar_lr),
-            dict(params=embeds_params, lr=self.cfg.embeds_lr),
-            dict(params=output_params, lr=self.cfg.output_lr),
-        ]
-
-        self.muon = Muon(
-            muon_params,
-            lr=self.cfg.muon_lr,
-            momentum=self.cfg.muon_mu,
-            weight_decay=self.cfg.muon_wd,
-        )
-        self.adamw = torch.optim.AdamW(
+        self.optims = []
+        if len(muon_params) > 0:
+            muon = Muon(
+                muon_params,
+                lr=self.cfg.muon_lr,
+                momentum=0.9,
+                weight_decay=self.cfg.wd,
+            )
+            self.optims.append(muon)
+        adamw = torch.optim.AdamW(
             adamw_params,
-            betas=[self.cfg.adamw_mu1, self.cfg.adamw_mu2],
-            weight_decay=self.cfg.adamw_wd,
+            lr=self.cfg.adamw_lr,
+            betas=[0.9, 0.99],
+            weight_decay=self.cfg.wd,
         )
-
-        self.optims = [self.muon, self.adamw]
+        self.optims.append(adamw)
         for opt in self.optims:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]
 
         self.step = 0
 
-    def log_once(self, s):
+    def log_once(self, s, level=logging.INFO):
         if self.is_main_process:
-            log.info(s)
-
-    def debug_once(self, s):
-        if self.is_main_process:
-            log.debug(s)
+            log.log(level, s)
 
     def schedule_lr(self):
         if (

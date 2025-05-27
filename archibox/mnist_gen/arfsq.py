@@ -14,12 +14,16 @@ from PIL import Image
 from torch.distributions import Categorical
 
 from archibox.components import FusedLinear, ReLU2, RMSNorm
-from archibox.metrics import Metrics
+from archibox.metrics import Metrics, rms
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.muon import Muon
 
 metrics = Metrics(enabled=False, use_wandb=False)
 log = logging.getLogger(__name__)
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+    DTYPE = torch.bfloat16
+else:
+    DTYPE = torch.float32
 
 
 @dataclass
@@ -67,6 +71,38 @@ class Config:
     lr_cooldown_ratio: float = 0.0
 
 
+def make_embedding(num_embeddings: int, embedding_dim: int, dtype=None):
+    embed = nn.Embedding(num_embeddings, embedding_dim)
+    if dtype is not None:
+        embed.to(dtype=DTYPE)
+    embed.weight._is_embed = True
+    embed.weight.data.mul_(0.5)
+    return embed
+
+
+def make_output_head(dim: int, out_dim: int):
+    head = nn.Sequential(
+        RMSNorm(dim, affine=False), FusedLinear(dim, out_dim, zero_init=True)
+    )
+    head[-1].weight._is_output = True
+    return head
+
+
+class EmbedModulatedMLP(nn.Module):
+    def __init__(self, dim: int, mlp_dim: int, num_embeddings: int):
+        super().__init__()
+        self.norm = RMSNorm(dim, affine=False)
+        self.wk = FusedLinear(dim, mlp_dim)
+        self.embed = make_embedding(num_embeddings, mlp_dim)
+        self.act = nn.SiLU()
+        self.wv = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
+
+    def forward(self, x, c):
+        scores = self.wk(self.norm(x)) * (1 + self.embed(c)).type_as(x)
+        scores = self.act(scores)
+        return self.wv(scores)
+
+
 class FSQ(nn.Module):
     def __init__(self, in_dim: int, ndim: int, bins: int):
         super().__init__()
@@ -74,6 +110,7 @@ class FSQ(nn.Module):
         self.in_proj = nn.Sequential(
             RMSNorm(in_dim, affine=False), FusedLinear(in_dim, ndim)
         )
+        self.in_proj[-1].weight._is_output = True
 
     def forward(self, x):
         latents = torch.tanh(self.in_proj(x).float())
@@ -87,48 +124,16 @@ class FSQ(nn.Module):
         return latents_ste.type_as(x), ids.long()
 
 
-def make_embedding(num_embeddings: int, embedding_dim: int, dtype=None):
-    embed = nn.Embedding(num_embeddings, embedding_dim)
-    if dtype is not None:
-        embed.to(dtype=dtype)
-    embed.weight._is_embed = True
-    embed.weight.data.mul_(0.5)
-    return embed
-
-
-class EmbedModulatedMLP(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int, vocab_size: int):
-        super().__init__()
-        self.norm = RMSNorm(dim, affine=False)
-        self.wk = FusedLinear(dim, mlp_dim)
-        self.embed = make_embedding(vocab_size, mlp_dim)
-        self.act = nn.SiLU()
-        self.wv = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
-
-    def forward(self, x, c):
-        scores = self.wk(self.norm(x)) * self.embed(c)
-        scores = self.act(scores)
-        return self.wv(scores)
-
-
-def make_output_head(dim: int, out_dim: int):
-    head = nn.Sequential(
-        RMSNorm(dim, affine=False), FusedLinear(dim, out_dim, zero_init=True)
-    )
-    head[-1].weight._is_output = True
-    return head
-
-
 class VectorARPrior(nn.Module):
     def __init__(
-        self, dim: int, mlp_dim: int, vocab_size: int, seq_len: int, prior_depth: int
+        self, dim: int, mlp_dim: int, vocab_size: int, seq_len: int, depth: int
     ):
         super().__init__()
         self.seq_len = seq_len
         self.vocab_size = vocab_size
-        self.pad_vocab_size = ((self.vocab_size + 127) // 128) * 128
+        pad_vocab_size = ((self.vocab_size + 127) // 128) * 128
 
-        self.prior = nn.ModuleList(
+        self.blocks = nn.ModuleList(
             [
                 nn.Sequential(
                     RMSNorm(dim, affine=False),
@@ -136,42 +141,62 @@ class VectorARPrior(nn.Module):
                     ReLU2(),
                     FusedLinear(mlp_dim, dim, scale=True, zero_init=True),
                 )
-                for _ in range(prior_depth)
+                for _ in range(depth)
             ]
         )
         self.heads = nn.ModuleList(
-            [make_output_head(dim, self.pad_vocab_size) for _ in range(seq_len)]
+            [make_output_head(dim, pad_vocab_size) for _ in range(seq_len)]
         )
         self.mlp_blocks = nn.ModuleList(
             [EmbedModulatedMLP(dim, mlp_dim, vocab_size) for _ in range(seq_len - 1)]
         )
 
     def loss(self, x_ND, token_ids_NL):
-        for block in self.prior:
+        for block in self.blocks:
             x_ND = x_ND + block(x_ND)
 
-        loss = 0
-        for i in range(self.seq_len):
-            logits = self.heads[i](x_ND)[..., : self.vocab_size]
-            loss = loss + F.cross_entropy(
-                logits.flatten(0, -2), token_ids_NL[..., i].flatten(), reduction="none"
+        losses = []
+        for s in range(self.seq_len):
+            logits = self.heads[s](x_ND)[..., : self.vocab_size]
+            xent = F.cross_entropy(
+                logits.flatten(0, -2), token_ids_NL[..., s].flatten(), reduction="none"
             )
-            if i < self.seq_len - 1:
-                x_ND = x_ND + self.mlp_blocks[i](x_ND, token_ids_NL[..., i])
+            losses.append(xent)
+            if s < self.seq_len - 1:
+                x_ND = x_ND + self.mlp_blocks[s](x_ND, token_ids_NL[..., s])
+        loss = torch.stack(losses, dim=0).mean(dim=0)
         return loss
 
     def sample(self, x_ND):
-        for block in self.prior:
+        for block in self.blocks:
             x_ND = x_ND + block(x_ND)
 
         outputs = []
-        for i in range(self.seq_len):
-            logits = self.heads[i](x_ND)[..., : self.vocab_size]
-            token_ids = Categorical(logits=logits).sample()
-            outputs.append(token_ids)
-            if i < self.seq_len - 1:
-                x_ND = x_ND + self.mlp_blocks[i](x_ND, token_ids)
+        for s in range(self.seq_len):
+            logits = self.heads[s](x_ND)[..., : self.vocab_size]
+            token_id = Categorical(logits=logits).sample()
+            outputs.append(token_id)
+            if s < self.seq_len - 1:
+                x_ND = x_ND + self.mlp_blocks[s](x_ND, token_id)
         return torch.stack(outputs, dim=-1)
+
+    def guided_sample(self, cond_ND, uncd_ND, lam: float):
+        for block in self.blocks:
+            cond_ND = cond_ND + block(cond_ND)
+            uncd_ND = uncd_ND + block(uncd_ND)
+
+        outputs = []
+        for s in range(self.seq_len):
+            logits_cond = self.heads[s](cond_ND)[..., : self.vocab_size]
+            logits_uncd = self.heads[s](uncd_ND)[..., : self.vocab_size]
+            logits = (lam + 1) * logits_cond - lam * logits_uncd
+            token_id = Categorical(logits=logits).sample()
+            outputs.append(token_id)
+            if s < self.seq_len - 1:
+                cond_ND = cond_ND + self.mlp_blocks[s](cond_ND, token_id)
+                uncd_ND = uncd_ND + self.mlp_blocks[s](uncd_ND, token_id)
+        outputs = torch.stack(outputs, dim=-1)
+        return outputs
 
 
 class VectorModulatedMLP(nn.Module):
@@ -179,12 +204,12 @@ class VectorModulatedMLP(nn.Module):
         super().__init__()
         self.norm = RMSNorm(dim, affine=False)
         self.wk = FusedLinear(dim, mlp_dim)
-        self.wc = FusedLinear(dim, mlp_dim)
+        self.wc = FusedLinear(dim, mlp_dim, zero_init=True)
         self.act = nn.SiLU()
         self.wv = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
 
     def forward(self, x, c):
-        scores = self.wk(self.norm(x)) * self.wc(self.norm(c))
+        scores = self.wk(self.norm(x)) * (1 + self.wc(self.norm(c)))
         scores = self.act(scores)
         return self.wv(scores)
 
@@ -202,7 +227,7 @@ class VectorModulatedMLPStack(nn.Module):
         return x
 
 
-class VectorARFSQ(nn.Module):
+class VectorFSQ(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -223,16 +248,18 @@ class VectorARFSQ(nn.Module):
         self.latent_bins = latent_bins
         self.latent_group_size = latent_group_size
         self.vocab_size = latent_bins**latent_group_size
+        self.seq_len = latent_ndim // latent_group_size
 
         self.encoder_in = FusedLinear(data_dim, dim, bias=True, gain=1.0)
         self.encoder = VectorModulatedMLPStack(dim, mlp_dim, encoder_depth)
-
-        self.seq_len = latent_ndim // latent_group_size
-        self.prior = VectorARPrior(
-            dim, mlp_dim, self.vocab_size, self.seq_len, prior_depth=prior_depth
-        )
-        self.fsq_norm = RMSNorm(dim, affine=False)
         self.fsq = FSQ(dim, latent_ndim, latent_bins)
+        self.prior = VectorARPrior(
+            dim=dim,
+            mlp_dim=mlp_dim,
+            vocab_size=self.vocab_size,
+            seq_len=self.seq_len,
+            depth=prior_depth,
+        )
         self.decoder_in = FusedLinear(latent_ndim, dim, bias=True, gain=1.0)
         self.decoder = VectorModulatedMLPStack(dim, mlp_dim, decoder_depth)
         self.decoder_head = make_output_head(dim, data_dim)
@@ -246,25 +273,26 @@ class VectorARFSQ(nn.Module):
         assert cond_ND.size(-1) == self.dim
 
         data_emb = self.encoder(self.encoder_in(data_ND), cond_ND)
-        latents_ND, latent_bins_ND = self.fsq(self.fsq_norm(data_emb))
+        latents_ND, latent_bins_ND = self.fsq(data_emb)
         latent_bins_NLG = rearrange(
             latent_bins_ND,
             "... (L G) -> ... L G",
             L=self.seq_len,
             G=self.latent_group_size,
         )
-        token_ids_N = (latent_bins_NLG * self._id_pows).sum(dim=-1)
-        xent_N = self.prior.loss(cond_ND, token_ids_N)
-
-        x_ND = self.decoder_in(latents_ND)
+        token_ids_NL = (latent_bins_NLG * self._id_pows).sum(dim=-1)
+        metrics.push(
+            fsq_latent_std=latents_ND.std(dim=0).mean(), fsq_cond_rms=rms(cond_ND)
+        )
+        xent_N = self.prior.loss(cond_ND, token_ids_NL)
+        x_ND = self.decoder_in(1.732 * latents_ND)
         x_ND = self.decoder(x_ND, cond_ND)
         reconstruction_ND = self.decoder_head(x_ND)
+        metrics.push(fsq_reconstruction_rms=rms(reconstruction_ND))
         mse_ND = (data_ND - reconstruction_ND).pow(2)
         return xent_N, mse_ND
 
-    def generate(self, cond_ND):
-        token_ids_NL = self.prior.sample(cond_ND)
-        assert token_ids_NL.shape == cond_ND.shape[:-1] + (self.seq_len,)
+    def decode(self, cond_ND, token_ids_NL):
         latents_NLG = (token_ids_NL.unsqueeze(-1) // self._id_pows) % self.latent_bins
         latents_ND = rearrange(
             latents_NLG,
@@ -273,10 +301,22 @@ class VectorARFSQ(nn.Module):
             G=self.latent_group_size,
         )
         latents_ND = latents_ND.type_as(cond_ND) * (2 / (self.latent_bins - 1)) - 1
-        x_ND = self.decoder_in(latents_ND)
+        assert latents_ND.min() >= -1.0, f"{latents_ND.min()=:.4f}"
+        assert latents_ND.max() <= 1.0, f"{latents_ND.max()=:.4f}"
+        x_ND = self.decoder_in(1.732 * latents_ND)
         x_ND = self.decoder(x_ND, cond_ND)
         reconstruction_ND = self.decoder_head(x_ND)
         return reconstruction_ND
+
+    def sample(self, cond_ND):
+        token_ids_NL = self.prior.sample(cond_ND)
+        assert token_ids_NL.shape == cond_ND.shape[:-1] + (self.seq_len,)
+        return self.decode(cond_ND, token_ids_NL)
+
+    def guided_sample(self, cond_ND, uncd_ND, lam: float):
+        token_ids_NL = self.prior.guided_sample(cond_ND, uncd_ND, lam)
+        assert token_ids_NL.shape == cond_ND.shape[:-1] + (self.seq_len,)
+        return self.decode(cond_ND, token_ids_NL)
 
 
 class MnistVectorFSQ(nn.Module):
@@ -285,8 +325,8 @@ class MnistVectorFSQ(nn.Module):
         self.cfg = cfg
         self.dtype = self.cfg.dtype
 
-        self.digit_embed = make_embedding(10, cfg.dim)
-        self.vector_fsq = VectorARFSQ(
+        self.digit_embed = make_embedding(11, cfg.dim)
+        self.vector_fsq = VectorFSQ(
             dim=cfg.dim,
             mlp_dim=cfg.mlp_dim,
             data_dim=28 * 28,
@@ -303,7 +343,10 @@ class MnistVectorFSQ(nn.Module):
         images = images.flatten(1, -1)
         images = (images - self.cfg.img_mean) / self.cfg.img_std
 
-        cond = self.digit_embed(labels).type(self.dtype)
+        cond = self.digit_embed(labels + 1).type(self.dtype)
+        # Randomly masked digit embed
+        mask = (torch.rand(labels.shape, device=labels.device) > 0.15).unsqueeze(-1)
+        cond = cond * mask
         xent, mse = self.vector_fsq.loss(images, cond)
         xent = xent.mean()
         mse = mse.mean()
@@ -312,9 +355,16 @@ class MnistVectorFSQ(nn.Module):
         return loss
 
     @torch.no_grad
-    def generate(self, labels_N):
-        cond = self.digit_embed(labels_N).type(self.dtype)
-        images = self.vector_fsq.generate(cond)
+    def sample(self, labels_N):
+        cond = self.digit_embed(labels_N + 1).type(self.dtype)
+        images = self.vector_fsq.sample(cond)
+        return images
+
+    @torch.no_grad
+    def guided_sample(self, labels_N, lam: float):
+        cond = self.digit_embed(labels_N + 1).type(self.dtype)
+        uncd = self.digit_embed(torch.zeros_like(labels_N)).type(self.dtype)
+        images = self.vector_fsq.guided_sample(cond, uncd, lam)
         return images
 
 
@@ -469,22 +519,35 @@ class Trainer:
             self.model(images, labels)
 
         rows = 5
-        # Generate and save samples
+        savedir = Path(self.cfg.savedir)
+        savedir.mkdir(exist_ok=True)
+        if self.step > 0:
+            name = f"step_{self.step + 1}"
+        else:
+            name = "initial"
+
+        # Generate samples
         labels_N = torch.arange(10 * rows, device=self.device) // rows
-        imgs_ND = self.model.generate(labels_N)
+        imgs_ND = self.model.sample(labels_N)
         imgs = rearrange(imgs_ND, "N (H W) -> N H W", H=28, W=28)
         imgs = imgs * self.model.cfg.img_std + self.model.cfg.img_mean
         imgs = imgs.clamp(0, 1) * 255
         imgs = imgs.type(torch.uint8)
         imgs = imgs.cpu().numpy()
 
-        savedir = Path(self.cfg.savedir)
-        savedir.mkdir(exist_ok=True)
-        if self.step > 0:
-            savepath = savedir / f"samples_step_{self.step + 1}.png"
-        else:
-            savepath = savedir / "samples_initial.png"
+        savepath = savedir / f"samples_{name}.png"
+        imgs = rearrange(imgs, "(D M) H W -> (M H) (D W)", D=10)
+        Image.fromarray(imgs).save(savepath)
 
+        # Generate guided samples
+        imgs_ND = self.model.guided_sample(labels_N, lam=1.0)
+        imgs = rearrange(imgs_ND, "N (H W) -> N H W", H=28, W=28)
+        imgs = imgs * self.model.cfg.img_std + self.model.cfg.img_mean
+        imgs = imgs.clamp(0, 1) * 255
+        imgs = imgs.type(torch.uint8)
+        imgs = imgs.cpu().numpy()
+
+        savepath = savedir / f"samples_{name}_guided.png"
         imgs = rearrange(imgs, "(D M) H W -> (M H) (D W)", D=10)
         Image.fromarray(imgs).save(savepath)
 
@@ -509,7 +572,7 @@ class Trainer:
         counts = [0 for _ in range(19)]
         for i in range(0, total, self.cfg.batch_size):
             labels_N = torch.arange(i, i + self.cfg.batch_size, device=self.device) % 10
-            imgs_ND = self.model.generate(labels_N)
+            imgs_ND = self.model.sample(labels_N)
             imgs_ND = imgs_ND * self.model.cfg.img_std + self.model.cfg.img_mean
             num_on_N = (imgs_ND.clamp(0, 1) > 0.1).long().sum(dim=1)
             num_on_N = num_on_N // 16

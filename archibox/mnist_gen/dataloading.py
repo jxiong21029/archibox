@@ -8,7 +8,12 @@ log = logging.getLogger(__name__)
 
 
 def mnist_loader(
-    train: bool, batch_size: int, epochs: int | None = None, device="cuda"
+    train: bool,
+    batch_size: int,
+    epochs: int | None = None,
+    rank: int = 0,
+    world_size: int = 1,
+    device="cuda",
 ):
     dataset_path = Path(__file__).parent / "data"
     dataset_path.mkdir(exist_ok=True)
@@ -19,11 +24,11 @@ def mnist_loader(
     idxs = list(range(len(images)))
     rng = random.Random(42)
     rng.shuffle(idxs)
-    ptr = 0
+    ptr = batch_size * rank
     epoch = 0
     while True:
         if ptr + batch_size >= len(idxs):
-            ptr = 0
+            ptr = batch_size * rank
             rng.shuffle(idxs)
             epoch += 1
             if epochs is not None and epoch >= epochs:
@@ -32,4 +37,4 @@ def mnist_loader(
 
         idx = idxs[ptr : ptr + batch_size]
         yield images[idx], labels[idx]
-        ptr += batch_size
+        ptr += batch_size * world_size
