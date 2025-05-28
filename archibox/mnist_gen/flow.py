@@ -193,9 +193,9 @@ class VectorFlow(nn.Module):
             ta = timesteps[i].view(1)
             tb = timesteps[i + 1].view(1)
             tA = (ta - churn_dt).clamp(min=0)
-            sA = tA * (torch.pi / 2)
             sa = ta * (torch.pi / 2)
             sb = tb * (torch.pi / 2)
+            sA = tA * (torch.pi / 2)
 
             if i > 0:
                 scale = sA.sin() / sa.sin()
