@@ -44,7 +44,7 @@ class Config:
     model: FlowConfig = field(default_factory=FlowConfig)
     do_compile: bool = False
     n_steps: int = 1_000
-    valid_every: int | None = 1000
+    valid_every: int | None = 500
     batch_size: int = 8192
 
     use_muon: bool = True
@@ -97,7 +97,7 @@ class VectorFlow(nn.Module):
         self.min_freq = min_freq
         self.max_mult = max_freq / min_freq
 
-        self.in_proj = FusedLinear(data_dim, dim)
+        self.in_proj = FusedLinear(data_dim, dim, bias=True)
         self.t_proj = FusedLinear(freq_dim * 2, dim)
         self.blocks = nn.ModuleList(
             [ConditionalMLPBlock(dim, mlp_dim) for _ in range(depth)]
@@ -130,35 +130,83 @@ class VectorFlow(nn.Module):
         vt = (-torch.sin(s) * x0 + torch.cos(s) * x1) * (torch.pi / 2)
 
         c = t_emb + cond
-        pt = self(xt.type(dtype), c)
+        pt = self(xt.type(dtype), t, c)
 
         loss = (pt - vt).pow(2)
         return loss
 
-    def forward(self, xt, c):
-        h = self.in_proj(xt)
+    def forward(self, xt, t, c):
+        h = self.in_proj(xt * (t * torch.pi / 2).sin().pow(0.5).type_as(xt))
+        # h = self.in_proj(xt)
+        # h = self.in_proj(xt * (t * torch.pi / 2).sin().type_as(xt))
         for block in self.blocks:
             h = h + block(h, c)
         return self.out_head(h).float()
 
     @torch.no_grad
-    def generate(self, cond, n_steps: int = 50):
+    def sample_heun(self, cond, n_steps: int = 50):
         device, dtype = cond.device, cond.dtype
 
         timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
         xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
 
         for i in range(n_steps):
-            t_start = timesteps[i].view(1)
-            t_stop = timesteps[i + 1].view(1)
-            t_start_emb = self.t_proj(self.time_embed(t_start).type(dtype))
-            t_stop_emb = self.t_proj(self.time_embed(t_stop).type(dtype))
+            ta = timesteps[i].view(1)
+            tb = timesteps[i + 1].view(1)
+            ta_emb = self.t_proj(self.time_embed(ta).type(dtype))
+            tb_emb = self.t_proj(self.time_embed(tb).type(dtype))
 
-            v_start = self(xt.type(dtype), cond + t_start_emb)
-            xt_stop = xt + (t_stop - t_start) * v_start
-            v_stop = self(xt_stop.type(dtype), cond + t_stop_emb)
+            va = self(xt.type(dtype), ta, cond + ta_emb)
+            xb = xt + (tb - ta) * va
+            vb = self(xb.type(dtype), tb, cond + tb_emb)
 
-            xt = xt + (t_stop - t_start) * (v_start + v_stop) / 2
+            xt = xt + (tb - ta) * (va + vb) / 2
+        return xt
+
+    @torch.no_grad
+    def sample_analytic(self, cond, n_steps: int = 50):
+        device, dtype = cond.device, cond.dtype
+
+        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
+        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
+
+        for i in range(n_steps):
+            ta = timesteps[i].view(1)
+            tb = timesteps[i + 1].view(1)
+            sa = ta * (torch.pi / 2)
+            sb = tb * (torch.pi / 2)
+
+            ta_emb = self.t_proj(self.time_embed(ta).type(dtype))
+            va = self(xt.type(dtype), ta, cond + ta_emb)
+            xt = torch.cos(sa - sb) * xt - (2 / torch.pi) * torch.sin(sa - sb) * va
+        return xt
+
+    @torch.no_grad
+    def sample_analytic_stochastic(self, cond, churn_ratio: float, n_steps: int = 50):
+        device, dtype = cond.device, cond.dtype
+
+        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
+        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
+        churn_dt = churn_ratio / n_steps
+
+        for i in range(n_steps):
+            ta = timesteps[i].view(1)
+            tb = timesteps[i + 1].view(1)
+            tA = (ta - churn_dt).clamp(min=0)
+            sA = tA * (torch.pi / 2)
+            sa = ta * (torch.pi / 2)
+            sb = tb * (torch.pi / 2)
+
+            if i > 0:
+                scale = sA.sin() / sa.sin()
+                extra_var = sA.cos().pow(2) - (sa.cos() * scale).pow(2)
+                xA = scale * xt + extra_var.sqrt() * torch.randn_like(xt)
+            else:
+                xA = xt
+
+            tA_emb = self.t_proj(self.time_embed(tA).type(dtype))
+            vA = self(xA.type(dtype), tA, cond + tA_emb)
+            xt = torch.cos(sA - sb) * xA - (2 / torch.pi) * torch.sin(sA - sb) * vA
         return xt
 
 
@@ -190,9 +238,11 @@ class MnistFlow(nn.Module):
         return loss
 
     @torch.no_grad
-    def generate(self, labels_N, n_steps: int = 50):
+    def generate(self, labels_N):
         class_emb_ND = self.class_embed(labels_N).type(DTYPE)
-        imgs_ND = self.flow.generate(class_emb_ND, n_steps=n_steps)
+        imgs_ND = self.flow.sample_analytic_stochastic(
+            class_emb_ND, churn_ratio=0.2, n_steps=512
+        )
         return imgs_ND
 
 
