@@ -50,7 +50,7 @@ class Metrics:
         if self.use_wandb:
             wandb.log(results)
         else:
-            log.info(str(results))
+            log.info(", ".join(f"{k}: {v:.4g}" for k, v in results.items()))
 
         for k in self.n:
             self.n[k] = 0
