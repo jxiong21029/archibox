@@ -34,7 +34,6 @@ class FlowConfig:
 
     img_mean: float = 0.5
     img_std: float = 0.5
-    input_scaling: str = "sqrt"
 
     churn_ratio: float = 0.2
 
@@ -69,7 +68,7 @@ def make_embedding(num_embeddings: int, embedding_dim: int):
 class ConditionalMLPBlock(nn.Module):
     def __init__(self, dim: int, mlp_dim: int):
         super().__init__()
-        self.norm = RMSNorm(dim, affine=False)
+        self.norm = RMSNorm(dim, affine=True)
         self.k = FusedLinear(dim, mlp_dim)
         self.wc = FusedLinear(dim, mlp_dim, scale=True, zero_init=True)
         self.act = nn.SiLU()
@@ -91,7 +90,6 @@ class VectorFlow(nn.Module):
         depth: int,
         min_freq: float,
         max_freq: float,
-        input_scaling: str,
     ):
         super().__init__()
         self.dim = dim
@@ -100,7 +98,6 @@ class VectorFlow(nn.Module):
         self.freq_dim = freq_dim
         self.min_freq = min_freq
         self.max_mult = max_freq / min_freq
-        self.input_scaling = input_scaling
 
         self.in_proj = FusedLinear(data_dim, dim, bias=True)
         self.t_proj = FusedLinear(freq_dim * 2, dim)
@@ -141,20 +138,8 @@ class VectorFlow(nn.Module):
         return loss
 
     def forward(self, xt, t, c):
-        if self.input_scaling == "none":
-            inputs = xt
-        elif self.input_scaling == "linear":
-            inputs = xt * t.type_as(xt)
-        elif self.input_scaling == "sqrt":
-            inputs = xt * t.pow(0.5).type_as(xt)
-        elif self.input_scaling == "sin":
-            inputs = xt * (t * torch.pi / 2).sin().type_as(xt)
-        elif self.input_scaling == "sin_sqrt":
-            inputs = xt * (t * torch.pi / 2).sin().pow(0.5).type_as(xt)
-        else:
-            raise ValueError(f"unrecognized input_scaling: {self.input_scaling!r}")
-
-        h = self.in_proj(inputs)
+        # h = self.in_proj(xt * t.pow(0.5).type_as(xt))
+        h = self.in_proj(xt)
         for block in self.blocks:
             h = h + block(h, c)
         return self.out_head(h).float()
@@ -239,7 +224,6 @@ class MnistFlow(nn.Module):
             depth=cfg.depth,
             min_freq=cfg.min_freq,
             max_freq=cfg.max_freq,
-            input_scaling=cfg.input_scaling,
         )
         self.class_embed = make_embedding(10, cfg.dim)
 
@@ -468,15 +452,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_scaling", type=str, default="sqrt")
     parser.add_argument("--churn_ratio", type=float, default=0.2)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
-    cfg = Config(
-        model=FlowConfig(input_scaling=args.input_scaling, churn_ratio=args.churn_ratio)
-    )
+    cfg = Config(model=FlowConfig(churn_ratio=args.churn_ratio))
     try:
         trainer = Trainer(cfg)
         trainer.run()
