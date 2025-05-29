@@ -33,7 +33,7 @@ def mnist_loader(
             epoch += 1
             if epochs is not None and epoch >= epochs:
                 break
-            log.debug(f"starting {epoch=}")
+            # log.debug(f"starting {epoch=}")
 
         idx = idxs[ptr : ptr + batch_size]
         yield images[idx], labels[idx]
