@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,11 +11,14 @@ import torch.nn as nn
 import tqdm
 from einops import rearrange
 from PIL import Image
+from torch import Tensor
 
 from archibox.components import FusedLinear, RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
+from archibox.mnist_gen.fid import FID
 from archibox.muon import Muon
+from archibox.utils import parse_config
 
 log = logging.getLogger(__name__)
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
@@ -35,7 +39,9 @@ class FlowConfig:
     img_mean: float = 0.5
     img_std: float = 0.5
 
-    churn_ratio: float = 0.2
+    solver: str = "analytic"
+    noise_ratio: float = 1.0
+    sampling_steps: int = 512
 
 
 @dataclass
@@ -80,17 +86,33 @@ class ConditionalMLPBlock(nn.Module):
         return self.v(scores)
 
 
-class VectorFlow(nn.Module):
+class FlatTrigflow(nn.Module):
+    """A modified version of trigflow for t in [0, 1]. Designed for flat vector data."""
+
     def __init__(
         self,
         dim: int,
         mlp_dim: int,
         data_dim: int,
-        freq_dim: int,
         depth: int,
         min_freq: float,
         max_freq: float,
+        freq_dim: int,
     ):
+        """
+        Args:
+            dim: dimensionality of main path
+            mlp_dim: dimensionality of the MLP blocks' hidden activations
+            data_dim: dimensionality of the input
+            depth: number of MLP blocks. total # of linear layers = 2 * depth + 2
+            min_freq: minimum frequency of the sinusoidal embedding for time
+                suggested: value between 1 and 2pi
+            max_freq: maximum frequency of the sinusoidal embedding for time
+                suggested: 100 * min_freq
+            freq_dim: dimensionality of the sinusoidal embedding for time
+                suggested: a power of two >= 256
+        """
+
         super().__init__()
         self.dim = dim
         self.mlp_dim = mlp_dim
@@ -109,7 +131,8 @@ class VectorFlow(nn.Module):
         )
         self.out_head[-1].weight._is_output = True
 
-    def time_embed(self, t):
+    def time_embed(self, t: Tensor) -> Tensor:
+        """Sinusoidal embedding for time. Expects input of shape (..., 1)"""
         assert t.size(-1) == 1
         freqs = self.min_freq * (
             self.max_mult ** torch.linspace(0, 1, self.freq_dim, device=t.device)
@@ -117,7 +140,7 @@ class VectorFlow(nn.Module):
         thetas = t.float() * freqs.float()
         return torch.cat([thetas.sin(), thetas.cos()], dim=-1)
 
-    def loss(self, inputs, cond):
+    def loss(self, inputs: Tensor, cond: Tensor) -> Tensor:
         assert inputs.size(-1) == self.data_dim
         assert cond.size(-1) == self.dim
         device, dtype = inputs.device, inputs.dtype
@@ -137,86 +160,102 @@ class VectorFlow(nn.Module):
         loss = (pt - vt).pow(2)
         return loss
 
-    def forward(self, xt, t, c):
+    def forward(self, xt: Tensor, t: Tensor, c: Tensor) -> Tensor:
         h = self.in_proj(xt * t.pow(0.5).type_as(xt))
         # h = self.in_proj(xt)
+        t_emb = self.t_proj(self.time_embed(t).type_as(h))
+        c = c + t_emb
         for block in self.blocks:
             h = h + block(h, c)
         return self.out_head(h).float()
 
     @torch.no_grad
-    def sample_heun(self, cond, n_steps: int = 50):
+    def sample_heun(self, cond: Tensor, noise_ratio: float, n_steps: int) -> Tensor:
+        """Samples using Heun's method as a solver for the PF-ODE.
+
+        Args:
+            cond: conditioning input
+            noise_ratio: ratio of the amount of noise added to the progress per step.
+                In each step, we take a reverse step (removing noise), then a forward
+                step (adding noise back), akin to Langevin dynamics. Set to 0 for
+                deterministic sampling.
+            n_steps: total # of heun steps == (total # of function evaluations / 2)
+        """
+
         device, dtype = cond.device, cond.dtype
 
         timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
         xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
+        noise_dt = noise_ratio / n_steps
 
         for i in range(n_steps):
             ta = timesteps[i].view(1)
             tb = timesteps[i + 1].view(1)
-            ta_emb = self.t_proj(self.time_embed(ta).type(dtype))
-            tb_emb = self.t_proj(self.time_embed(tb).type(dtype))
-
-            va = self(xt.type(dtype), ta, cond + ta_emb)
-            xb = xt + (tb - ta) * va
-            vb = self(xb.type(dtype), tb, cond + tb_emb)
-
-            xt = xt + (tb - ta) * (va + vb) / 2
-        return xt
-
-    @torch.no_grad
-    def sample_analytic(self, cond, n_steps: int = 50):
-        device, dtype = cond.device, cond.dtype
-
-        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
-
-        for i in range(n_steps):
-            ta = timesteps[i].view(1)
-            tb = timesteps[i + 1].view(1)
-            sa = ta * (torch.pi / 2)
+            tc = (timesteps[i + 1].view(1) + noise_dt).clamp(max=1)
             sb = tb * (torch.pi / 2)
+            sc = tc * (torch.pi / 2)
 
-            ta_emb = self.t_proj(self.time_embed(ta).type(dtype))
-            va = self(xt.type(dtype), ta, cond + ta_emb)
-            xt = torch.cos(sa - sb) * xt - (2 / torch.pi) * torch.sin(sa - sb) * va
-        return xt
+            va = self(xt.type(dtype), ta, cond)
+            xc = xt + (tc - ta) * va
+            vc = self(xc.type(dtype), tc, cond)
+            xc = xt + (tc - ta) * (va + vc) / 2
 
-    @torch.no_grad
-    def sample_analytic_stochastic(self, cond, churn_ratio: float, n_steps: int = 50):
-        device, dtype = cond.device, cond.dtype
-
-        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
-        churn_dt = churn_ratio / n_steps
-
-        for i in range(n_steps):
-            ta = timesteps[i].view(1)
-            tb = timesteps[i + 1].view(1)
-            tA = (ta - churn_dt).clamp(min=0)
-            sa = ta * (torch.pi / 2)
-            sb = tb * (torch.pi / 2)
-            sA = tA * (torch.pi / 2)
-
-            if i > 0:
-                scale = sA.sin() / sa.sin()
-                extra_var = sA.cos().pow(2) - (sa.cos() * scale).pow(2)
-                xA = scale * xt + extra_var.sqrt() * torch.randn_like(xt)
+            if sb < sc:
+                scale = sb.sin() / sc.sin()
+                extra_var = sb.cos().pow(2) - (sc.cos() * scale).pow(2)
+                xt = scale * xc + extra_var.sqrt() * torch.randn_like(xt)
             else:
-                xA = xt
+                xt = xc
+        return xt
 
-            tA_emb = self.t_proj(self.time_embed(tA).type(dtype))
-            vA = self(xA.type(dtype), tA, cond + tA_emb)
-            xt = torch.cos(sA - sb) * xA - (2 / torch.pi) * torch.sin(sA - sb) * vA
+    @torch.no_grad
+    def sample_analytic(self, cond: Tensor, noise_ratio: float, n_steps: int) -> Tensor:
+        """Solves for the next timestep's xt using the forward process equation.
+
+        Leverages the fact that we know xt = sin(s) x + cos(s) z and vt = pi/2 cos(s) x
+        - pi/2 sin(s) z. We can plug in the value of xt and the model's estimate of vt
+        to solve for x and z, and then compute the estimated value of xt' for any t'.
+
+        Args:
+            cond: conditioning input
+            noise_ratio: ratio of the amount of noise added to the progress per step.
+                In each step, we take a reverse step (from ta -> tc, removing noise),
+                then a forward step (from tc -> tb, adding noise back), akin to Langevin
+                dynamics. Set noise_ratio to 0 for deterministic sampling.
+            n_steps: total # of model evaluations
+        """
+        device, dtype = cond.device, cond.dtype
+
+        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
+        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
+        noise_dt = noise_ratio / n_steps
+
+        for i in range(n_steps):
+            ta = timesteps[i].view(1)
+            tb = timesteps[i + 1].view(1)
+            tc = (timesteps[i + 1].view(1) + noise_dt).clamp(max=1)
+            sa = ta * (torch.pi / 2)
+            sb = tb * (torch.pi / 2)
+            sc = tc * (torch.pi / 2)
+
+            va = self(xt.type(dtype), ta, cond)
+            xc = torch.cos(sa - sc) * xt - (2 / torch.pi) * torch.sin(sa - sc) * va
+            if sb < sc:
+                scale = sb.sin() / sc.sin()
+                extra_var = sb.cos().pow(2) - (sc.cos() * scale).pow(2)
+                xt = scale * xc + extra_var.sqrt() * torch.randn_like(xt)
+            else:
+                xt = xc
         return xt
 
 
 class MnistFlow(nn.Module):
     def __init__(self, cfg: FlowConfig, metrics: Metrics):
+        assert cfg.solver in ("analytic", "heun")
         super().__init__()
         self.cfg = cfg
         self.metrics = metrics
-        self.flow = VectorFlow(
+        self.flow = FlatTrigflow(
             dim=cfg.dim,
             mlp_dim=cfg.mlp_dim,
             data_dim=28 * 28,
@@ -241,8 +280,15 @@ class MnistFlow(nn.Module):
     @torch.no_grad
     def generate(self, labels_N):
         class_emb_ND = self.class_embed(labels_N).type(DTYPE)
-        imgs_ND = self.flow.sample_analytic_stochastic(
-            class_emb_ND, churn_ratio=self.cfg.churn_ratio, n_steps=512
+        if self.cfg.solver == "analytic":
+            sample_fn = self.flow.sample_analytic
+        else:
+            assert self.cfg.solver == "heun"
+            sample_fn = self.flow.sample_heun
+        imgs_ND = sample_fn(
+            class_emb_ND,
+            noise_ratio=self.cfg.noise_ratio,
+            n_steps=self.cfg.sampling_steps,
         )
         return imgs_ND
 
@@ -261,6 +307,8 @@ class Trainer:
             dist.init_process_group(backend="nccl", device_id=self.device)
 
         log.info(f"using {DTYPE=}")
+        random.seed(self.rank)
+        np.random.seed(self.rank)
         torch.manual_seed(self.rank)
         torch.cuda.manual_seed(self.rank)
 
@@ -330,6 +378,9 @@ class Trainer:
                 group["initial_lr"] = group["lr"]
 
         self.step = 0
+
+        self.fid = FID.from_pretrained()
+        self.fid.model.to(self.device)
 
     def log_once(self, s, level=logging.INFO):
         if self.is_main_process:
@@ -407,24 +458,20 @@ class Trainer:
             truth = rearrange(truth, "(D M) H W -> (M H) (D W)", D=10)
             Image.fromarray(truth).save(Path(__file__).parent / "data/truth.png")
 
-        # Compute FID-like metric based on distribution of # pixels on per image
-        total = 10_000
-        counts = [0 for _ in range(19)]
-        for i in range(0, total, self.cfg.batch_size):
+        # Compute FID-like metric using features from an MLP classifier
+        total = 50_000
+        samples = []
+        for i in tqdm.trange(0, total, self.cfg.batch_size, desc="computing fid"):
             labels_N = torch.arange(i, i + self.cfg.batch_size, device=self.device) % 10
             imgs_ND = self.model.generate(labels_N)
             imgs_ND = imgs_ND * self.model.cfg.img_std + self.model.cfg.img_mean
-            num_on_N = (imgs_ND.clamp(0, 1) > 0.1).long().sum(dim=1)
-            num_on_N = num_on_N // 16
-            for n in num_on_N.cpu().numpy():
-                counts[min(n, 18)] += 1
-        counts = np.array(counts)
-        fracs = counts / counts.sum()
-        ref_fracs = np.load(Path(__file__).parent / "data/ratios.npy")
-        distance = np.abs(fracs - ref_fracs).mean()
-        self.metrics.push(pixel_counts_distance=distance)
-        self.metrics.report()
+            imgs_ND = imgs_ND.clamp(0, 1) * 2.0 - 1.0
+            samples.append(imgs_ND)
+        samples_ND = torch.cat(samples)
+        fid = self.fid.compute_fid(samples_ND)
+        self.metrics.push(fid=fid)
 
+        self.metrics.report()
         self.model.train()
         self.metrics.context = "train_"
 
@@ -448,16 +495,9 @@ class Trainer:
                 progress_bar.update(1)
 
 
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--churn_ratio", type=float, default=0.2)
-    args = parser.parse_args()
-
+@parse_config
+def main(cfg: Config):
     logging.basicConfig(level=logging.INFO)
-
-    cfg = Config(model=FlowConfig(churn_ratio=args.churn_ratio))
     try:
         trainer = Trainer(cfg)
         trainer.run()
