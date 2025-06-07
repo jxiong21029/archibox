@@ -1,4 +1,7 @@
+import logging
+
 import torch
+import torch.nn as nn
 
 ortho_dtype = (
     torch.bfloat16
@@ -6,8 +9,9 @@ ortho_dtype = (
     else torch.float32
 )
 
+log = logging.getLogger(__name__)
 
-@torch.compile
+
 def orthogonalize(G):
     """Computes the semi-orthogonalization of G with Newton-Schulz iteration."""
     assert G.ndim >= 2
@@ -44,9 +48,6 @@ class Muon(torch.optim.Optimizer):
     NOTE: This optimizer should not be used for the embedding layer, the final fully
     connected layer, or any {0,1}-D parameters; those should be optimized by a standard
     method (e.g., AdamW).
-
-    NOTE: This is a naive implementation in which every device computes the
-    orthogonalization for all parameters. Compatible with DistributedDataParallel.
     """
 
     def __init__(
@@ -85,94 +86,54 @@ class Muon(torch.optim.Optimizer):
                 param.sub_(g, alpha=lr)
 
 
-# class DistributedMuon(torch.optim.Optimizer):
-#     def __init__(
-#         self,
-#         params,
-#         lr: float = 0.01,
-#         momentum: float = 0.9,
-#         weight_decay: float = 0.01,
-#         nesterov: bool = True,
-#     ):
-#         defaults = dict(
-#             lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov
-#         )
-#         super().__init__(params, defaults)
-#         self.rank = int(os.environ["RANK"])
-#         self.world_size = int(os.environ["WORLD_SIZE"])
+def split_muon_adamw_params(
+    module: nn.Module,
+    verbose: bool = False,
+) -> tuple[
+    list[nn.Parameter], list[nn.Parameter], list[nn.Parameter], list[nn.Parameter]
+]:
+    muon_params = []
+    scalar_params = []
+    embeds_params = []
+    output_params = []
+    for name, p in module.named_parameters():
+        shape = tuple(p.shape)
+        if not p.requires_grad:
+            msg = f"{name} {shape} requires_grad=False, skipped"
+        elif p.ndim < 2 or (hasattr(p, "_is_scalar") and p._is_scalar):
+            msg = f"{name} {shape} (scalar) assigned to AdamW"
+            scalar_params.append(p)
+        elif hasattr(p, "_is_embed") and p._is_embed:
+            msg = f"{name} {shape} (embed) assigned to AdamW"
+            embeds_params.append(p)
+        elif hasattr(p, "_is_output") and p._is_output:
+            msg = f"{name} {shape} (output) assigned to AdamW"
+            output_params.append(p)
+        else:
+            if hasattr(p, "_ortho"):
+                raise ValueError(
+                    "_ortho is deprecated, use _is_embed or _is_output instead"
+                )
+            msg = f"{name} {shape} assigned to Muon"
+            muon_params.append(p)
+        if verbose:
+            log.info(msg)
 
-#         for group in self.param_groups:
-#             group["ordered_params"] = sorted(group["params"], key=lambda p: p.numel())
-
-#     @torch.no_grad
-#     def step(self):
-#         for group in self.param_groups:
-#             lr = group["lr"]
-#             weight_decay = group["weight_decay"]
-#             momentum = group["momentum"]
-#             nesterov = group["nesterov"]
-
-#             responsible_rank = 0
-#             last_reduce = None
-#             last_sync = None
-#             queue = [None for _ in range(self.world_size)]
-
-#             for param in group["ordered_params"]:
-#                 grad = param.grad
-#                 if grad is None:
-#                     continue
-
-#                 # Divide then sum to avoid overflow
-#                 grad.div_(self.world_size)
-#                 reduce_handle = dist.reduce(grad, dst=responsible_rank, async_op=True)
-#                 if self.rank == responsible_rank:
-#                     state = self.state[param]
-#                     if "momentum_buffer" not in state:
-#                         state["momentum_buffer"] = torch.zeros_like(grad)
-#                     buf = state["momentum_buffer"]
-#                     buf.lerp_(grad, 1 - momentum)
-#                     grad = grad.lerp_(buf, momentum) if nesterov else buf
-#                     grad = orthogonalize(grad).add_(param, alpha=weight_decay)
-#                 sync_handle = dist.broadcast(param, src=responsible_rank, async_op=True)
-
-#                 # if queue[responsible_rank] is not None:
-#                 #     if self.rank == responsible_rank:
-#                 #         last_update.wait()
-#                 #         queue[responsible_rank].sub_(
-#                 #             queue[responsible_rank].grad, alpha=lr
-#                 #         )
-#                 #     sync_handle = dist.broadcast(
-#                 #         queue[responsible_rank], src=responsible_rank, async_op=True
-#                 #     )
-#                 #     if self.rank == responsible_rank:
-#                 #         if last_sync is not None:
-#                 #             last_sync.wait()
-#                 #         last_sync = sync_handle
-#                 # queue[responsible_rank] = param
-
-#                 # if self.rank == responsible_rank:
-
-#                 #     def compute_update(fut):
-#                 #         g = fut.value()[0]
-#                 #         state = self.state[param]
-#                 #         if "momentum_buffer" not in state:
-#                 #             state["momentum_buffer"] = torch.zeros_like(g)
-#                 #         buf = state["momentum_buffer"]
-#                 #         buf.lerp_(g, 1 - momentum)
-#                 #         g = g.lerp_(buf, momentum) if nesterov else buf
-#                 #         g = orthogonalize(g).add_(param, alpha=weight_decay)
-#                 #         grad.copy_(g)
-#                 #         return grad
-
-#                 #     last_update = reduce_handle.get_future().then(compute_update)
-
-#                 responsible_rank = (responsible_rank + 1) % self.world_size
-
-#             if last_update is not None:
-#                 last_update.wait()
-#             if last_sync is not None:
-#                 last_sync.wait()
-
-#             for i, param in enumerate(queue):
-#                 if param is not None:
-#                     dist.broadcast(queue[i], src=i)
+    if verbose:
+        total_params = sum(
+            p.numel()
+            for p in muon_params + scalar_params + embeds_params + output_params
+        )
+        total_param_tensors = sum(
+            len(group)
+            for group in (muon_params, scalar_params, embeds_params, output_params)
+        )
+        log.info(
+            "parameter information:\n"
+            f"- muon params: {sum(p.numel() for p in muon_params):,} over {len(muon_params):,} tensors\n"
+            f"- scalar params: {sum(p.numel() for p in scalar_params):,} over {len(scalar_params):,} tensors\n"
+            f"- embeds params: {sum(p.numel() for p in embeds_params):,} over {len(embeds_params):,} tensors\n"
+            f"- output params: {sum(p.numel() for p in output_params):,} over {len(output_params):,} tensors\n"
+            f"total: {total_params:,} over {total_param_tensors:,} tensors"
+        )
+    return muon_params, scalar_params, embeds_params, output_params

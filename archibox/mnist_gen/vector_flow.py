@@ -17,7 +17,7 @@ from archibox.components import FusedLinear, RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.mnist_gen.fid import FID
-from archibox.muon import Muon
+from archibox.muon import Muon, split_muon_adamw_params
 from archibox.utils import parse_config
 
 log = logging.getLogger(__name__)
@@ -39,9 +39,9 @@ class FlowConfig:
     img_mean: float = 0.5
     img_std: float = 0.5
 
-    solver: str = "analytic"
-    noise_ratio: float = 1.0
-    sampling_steps: int = 512
+    solver: str = "heun"
+    noise_ratio: float = 0.1
+    sampling_steps: int = 32
 
 
 @dataclass
@@ -117,10 +117,10 @@ class FlatTrigflow(nn.Module):
         self.dim = dim
         self.mlp_dim = mlp_dim
         self.data_dim = data_dim
-        self.freq_dim = freq_dim
-        self.min_freq = min_freq
-        self.max_mult = max_freq / min_freq
 
+        self.freqs = nn.Parameter(
+            min_freq * ((max_freq / min_freq) ** torch.linspace(0, 1, freq_dim))
+        )
         self.in_proj = FusedLinear(data_dim, dim, bias=True)
         self.t_proj = FusedLinear(freq_dim * 2, dim)
         self.blocks = nn.ModuleList(
@@ -134,10 +134,7 @@ class FlatTrigflow(nn.Module):
     def time_embed(self, t: Tensor) -> Tensor:
         """Sinusoidal embedding for time. Expects input of shape (..., 1)"""
         assert t.size(-1) == 1
-        freqs = self.min_freq * (
-            self.max_mult ** torch.linspace(0, 1, self.freq_dim, device=t.device)
-        )
-        thetas = t.float() * freqs.float()
+        thetas = t.float() * self.freqs.float()
         return torch.cat([thetas.sin(), thetas.cos()], dim=-1)
 
     def loss(self, inputs: Tensor, cond: Tensor) -> Tensor:
@@ -145,17 +142,15 @@ class FlatTrigflow(nn.Module):
         assert cond.size(-1) == self.dim
         device, dtype = inputs.device, inputs.dtype
 
-        x1 = inputs.float()
         t = torch.sigmoid(torch.randn(inputs.shape[:-1] + (1,), device=device))
-        t_emb = self.t_proj(self.time_embed(t).type(dtype))
-
-        x0 = torch.randn_like(x1)
         s = t * (torch.pi / 2)
-        xt = torch.cos(s) * x0 + torch.sin(s) * x1
-        vt = (-torch.sin(s) * x0 + torch.cos(s) * x1) * (torch.pi / 2)
 
-        c = t_emb + cond
-        pt = self(xt.type(dtype), t, c)
+        x1 = inputs.float()
+        z = torch.randn_like(x1)
+        xt = torch.sin(s) * x1 + torch.cos(s) * z
+        vt = (torch.pi / 2) * (torch.cos(s) * x1 - torch.sin(s) * z)
+
+        pt = self(xt.type(dtype), t, cond)
 
         loss = (pt - vt).pow(2)
         return loss
@@ -169,66 +164,53 @@ class FlatTrigflow(nn.Module):
             h = h + block(h, c)
         return self.out_head(h).float()
 
-    @torch.no_grad
-    def sample_heun(self, cond: Tensor, noise_ratio: float, n_steps: int) -> Tensor:
-        """Samples using Heun's method as a solver for the PF-ODE.
+    def clamp_velocity(self, xt, vt, s, minval: float | None, maxval: float | None):
+        if minval is None and maxval is None:
+            return vt
+        if torch.cos(s) < 0.01:
+            return vt
 
-        Args:
-            cond: conditioning input
-            noise_ratio: ratio of the amount of noise added to the progress per step.
-                In each step, we take a reverse step (removing noise), then a forward
-                step (adding noise back), akin to Langevin dynamics. Set to 0 for
-                deterministic sampling.
-            n_steps: total # of heun steps == (total # of function evaluations / 2)
+        x1 = torch.sin(s) * xt + (2 / torch.pi) * torch.cos(s) * vt
+        x1 = torch.clamp(x1, minval, maxval)
+        vt = (torch.pi / 2) * (x1 - torch.sin(s) * xt) / torch.cos(s)
+        return vt
+
+    @torch.no_grad()
+    def sample(
+        self,
+        c: Tensor,
+        noise_ratio: float,
+        n_steps: int,
+        u: Tensor | None = None,
+        lam: float = 0.0,
+        minval: float | None = None,
+        maxval: float | None = None,
+        analytic_step: bool = True,
+        use_heun: bool = False,
+    ) -> Tensor:
         """
-
-        device, dtype = cond.device, cond.dtype
-
-        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
-        noise_dt = noise_ratio / n_steps
-
-        for i in range(n_steps):
-            ta = timesteps[i].view(1)
-            tb = timesteps[i + 1].view(1)
-            tc = (timesteps[i + 1].view(1) + noise_dt).clamp(max=1)
-            sb = tb * (torch.pi / 2)
-            sc = tc * (torch.pi / 2)
-
-            va = self(xt.type(dtype), ta, cond)
-            xc = xt + (tc - ta) * va
-            vc = self(xc.type(dtype), tc, cond)
-            xc = xt + (tc - ta) * (va + vc) / 2
-
-            if sb < sc:
-                scale = sb.sin() / sc.sin()
-                extra_var = sb.cos().pow(2) - (sc.cos() * scale).pow(2)
-                xt = scale * xc + extra_var.sqrt() * torch.randn_like(xt)
-            else:
-                xt = xc
-        return xt
-
-    @torch.no_grad
-    def sample_analytic(self, cond: Tensor, noise_ratio: float, n_steps: int) -> Tensor:
-        """Solves for the next timestep's xt using the forward process equation.
-
-        Leverages the fact that we know xt = sin(s) x + cos(s) z and vt = pi/2 cos(s) x
-        - pi/2 sin(s) z. We can plug in the value of xt and the model's estimate of vt
-        to solve for x and z, and then compute the estimated value of xt' for any t'.
-
         Args:
-            cond: conditioning input
+            c: conditioning input
             noise_ratio: ratio of the amount of noise added to the progress per step.
                 In each step, we take a reverse step (from ta -> tc, removing noise),
                 then a forward step (from tc -> tb, adding noise back), akin to Langevin
                 dynamics. Set noise_ratio to 0 for deterministic sampling.
             n_steps: total # of model evaluations
+            u: unconditional input (for classifier-free guidance)
+            lam: classifier-free guidance scale
+            minval: force samples to be above this value
+            maxval: force samples to be below this value
+            analytic_step: when True, the sampler leverages the fact that we know xt =
+                sin(s) x + cos(s) z and vt = pi/2 cos(s) x - pi/2 sin(s) z, so the
+                value of xt' for the next t' can be estimated by solving for x and z
+            use_heun: when True, two velocity estimates are averaged for each step
         """
-        device, dtype = cond.device, cond.dtype
+        device, dtype = c.device, c.dtype
 
         timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn(cond.shape[:-1] + (self.data_dim,), device=device)
+        xt = torch.randn(c.shape[:-1] + (self.data_dim,), device=device)
         noise_dt = noise_ratio / n_steps
+        do_guidance = (u is not None) and (lam != 0)
 
         for i in range(n_steps):
             ta = timesteps[i].view(1)
@@ -238,8 +220,32 @@ class FlatTrigflow(nn.Module):
             sb = tb * (torch.pi / 2)
             sc = tc * (torch.pi / 2)
 
-            va = self(xt.type(dtype), ta, cond)
-            xc = torch.cos(sa - sc) * xt - (2 / torch.pi) * torch.sin(sa - sc) * va
+            va = self(xt.type(dtype), ta, c)
+            if do_guidance:
+                va_uncond = self(xt.type(dtype), ta, u)
+                va = va * (lam + 1.0) - va_uncond * lam
+            va = self.clamp_velocity(xt, va, sa, minval, maxval)
+
+            if analytic_step:
+                xc = torch.cos(sa - sc) * xt - (2 / torch.pi) * torch.sin(sa - sc) * va
+            else:
+                xc = xt + (tc - ta) * va
+
+            if use_heun:
+                vc = self(xc.type(dtype), tc, c)
+                if do_guidance:
+                    vc_uncond = self(vc.type(dtype), tc, u)
+                    vc = vc * (lam + 1.0) - vc_uncond * lam
+                vc = self.clamp_velocity(xc, vc, sc, minval, maxval)
+
+                if analytic_step:
+                    # Using heun with analytic_step=True is a bit sus.
+                    xc = torch.cos(sa - sc) * xt - (1 / torch.pi) * torch.sin(
+                        sa - sc
+                    ) * (va + vc)
+                else:
+                    xc = xt + 0.5 * (tc - ta) * (va + vc)
+
             if sb < sc:
                 scale = sb.sin() / sc.sin()
                 extra_var = sb.cos().pow(2) - (sc.cos() * scale).pow(2)
@@ -277,18 +283,17 @@ class MnistFlow(nn.Module):
         self.metrics.push(loss=loss)
         return loss
 
-    @torch.no_grad
+    @torch.no_grad()
     def generate(self, labels_N):
         class_emb_ND = self.class_embed(labels_N).type(DTYPE)
-        if self.cfg.solver == "analytic":
-            sample_fn = self.flow.sample_analytic
-        else:
-            assert self.cfg.solver == "heun"
-            sample_fn = self.flow.sample_heun
-        imgs_ND = sample_fn(
+        imgs_ND = self.flow.sample(
             class_emb_ND,
             noise_ratio=self.cfg.noise_ratio,
             n_steps=self.cfg.sampling_steps,
+            minval=-self.cfg.img_mean / self.cfg.img_std,
+            maxval=(1 - self.cfg.img_mean) / self.cfg.img_std,
+            analytic_step=self.cfg.solver == "analytic",
+            use_heun=self.cfg.solver == "heun",
         )
         return imgs_ND
 
@@ -325,38 +330,10 @@ class Trainer:
         if cfg.do_compile:
             self.model = torch.compile(self.model)
 
-        muon_params = []
-        adamw_params = []
-        for name, p in self.model.named_parameters():
-            shape = tuple(p.shape)
-            if not p.requires_grad:
-                self.log_once(
-                    f"{name} {shape} requires_grad=False, skipped", logging.DEBUG
-                )
-                continue
-            elif (
-                p.ndim < 2
-                or not cfg.use_muon
-                or (hasattr(p, "_is_embed") and p._is_embed)
-                or (hasattr(p, "_is_output") and p._is_output)
-            ):
-                self.log_once(f"{name} {shape} assigned to AdamW", logging.DEBUG)
-                adamw_params.append(p)
-            else:
-                self.log_once(f"{name} {shape} assigned to Muon", logging.DEBUG)
-                muon_params.append(p)
+        muon_params, scalar_params, embeds_params, output_params = (
+            split_muon_adamw_params(self.model, verbose=True)
+        )
 
-        if self.is_main_process:
-            total_params = sum(p.numel() for p in muon_params + adamw_params)
-            total_param_tensors = sum(
-                len(group) for group in (muon_params, adamw_params)
-            )
-            log.info(
-                "parameter information:\n"
-                f"- muon params: {sum(p.numel() for p in muon_params):,} over {len(muon_params):,} tensors\n"
-                f"- adamw params: {sum(p.numel() for p in adamw_params):,} over {len(adamw_params):,} tensors\n"
-                f"total: {total_params:,} over {total_param_tensors:,} tensors"
-            )
         self.optims = []
         if len(muon_params) > 0:
             muon = Muon(
@@ -367,7 +344,7 @@ class Trainer:
             )
             self.optims.append(muon)
         adamw = torch.optim.AdamW(
-            adamw_params,
+            scalar_params + embeds_params + output_params,
             lr=self.cfg.adamw_lr,
             betas=[0.9, 0.99],
             weight_decay=self.cfg.wd,
@@ -413,7 +390,7 @@ class Trainer:
         for optim in self.optims:
             optim.zero_grad(set_to_none=True)
 
-    @torch.no_grad
+    @torch.no_grad()
     def valid_epoch(self):
         self.model.eval()
         self.metrics.context = "valid_"
@@ -458,18 +435,32 @@ class Trainer:
             truth = rearrange(truth, "(D M) H W -> (M H) (D W)", D=10)
             Image.fromarray(truth).save(Path(__file__).parent / "data/truth.png")
 
-        # Compute FID-like metric using features from an MLP classifier
+        # FID-like metric(s)
         total = 50_000
         samples = []
+        counts_histogram = [0 for _ in range(19)]
         for i in tqdm.trange(0, total, self.cfg.batch_size, desc="computing fid"):
             labels_N = torch.arange(i, i + self.cfg.batch_size, device=self.device) % 10
             imgs_ND = self.model.generate(labels_N)
             imgs_ND = imgs_ND * self.model.cfg.img_std + self.model.cfg.img_mean
             imgs_ND = imgs_ND.clamp(0, 1) * 2.0 - 1.0
             samples.append(imgs_ND)
+
+            n_pixels_on = (imgs_ND > 0.1).long().sum(dim=1) // 16
+            for n in n_pixels_on.cpu().numpy():
+                counts_histogram[min(n, 18)] += 1
+
+        # Metric based on MLP features
         samples_ND = torch.cat(samples)
         fid = self.fid.compute_fid(samples_ND)
-        self.metrics.push(fid=fid)
+        self.metrics.push(mlp_fid=fid)
+
+        # Metric based on distribution of # of pixels enabled per image
+        counts_histogram = np.array(counts_histogram)
+        counts_histogram = counts_histogram / counts_histogram.sum()
+        reference_hist = np.load(Path(__file__).parent / "data/ratios.npy")
+        histogram_dist = np.abs(counts_histogram - reference_hist).mean()
+        self.metrics.push(hist_fid=histogram_dist)
 
         self.metrics.report()
         self.model.train()
