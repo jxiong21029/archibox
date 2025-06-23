@@ -74,9 +74,20 @@ class FID:
         N, D = samples_ND.shape
         assert torch.is_floating_point(samples_ND)
         assert D == 28 * 28
-        if samples_ND.amax() > 1.0 or not (-1.0 <= samples_ND.amin() < 0.0):
+        if samples_ND.amax() > 1.0:
             log.warning(
-                "samples seem improperly normalized; should be normalized to [-1, 1]"
+                "samples seem improperly normalized; should be normalized to [-1, 1], "
+                "but found values larger than 1.0"
+            )
+        elif samples_ND.amin() < -1.0:
+            log.warning(
+                "samples seem improperly normalized; should be normalized to [-1, 1], "
+                "but found values less than -1.0"
+            )
+        elif samples_ND.amin() >= 0:
+            log.warning(
+                "samples seem improperly normalized; should be normalized to [-1, 1], "
+                "but found no values less than 0.0"
             )
 
         feats_fake = []

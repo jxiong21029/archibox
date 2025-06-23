@@ -1,8 +1,8 @@
 import logging
 import os
 import random
-from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -11,9 +11,11 @@ import torch.nn as nn
 import tqdm
 from einops import rearrange
 from PIL import Image
+from pydantic import BaseModel, Field
 from torch import Tensor
+from torch.func import jvp
 
-from archibox.components import FusedLinear, RMSNorm
+from archibox.components import FusedLinear, RMSNorm, make_output_head
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.mnist_gen.fid import FID
@@ -28,33 +30,40 @@ else:
 metrics = Metrics(enabled=False, use_wandb=False)
 
 
-@dataclass
-class FlowConfig:
+class FlowConfig(BaseModel):
+    schedule: Literal["trig", "linear"] = "trig"
+    lognorm_mu: float = 0.0
+    lognorm_std: float = 1.0
+    loss_wt_power: float = 0.0
+    consistency_steps: int = 0
+    loss_consistency_wt: float = 0.0
+
+    sample_shape: list[int] = (28 * 28,)
+    sampling_steps: int = 64
+
+
+class MLPConfig(BaseModel):
+    data_dim: int = 28 * 28
     dim: int = 1024
     mlp_dim: int = 2048
-    freq_dim: int = 1024
-    min_freq: float = 2 * torch.pi
-    max_freq: float = 200 * torch.pi
+    freq_dim: int = 256
+    # norm_fourier_freqs: tuple[float, float] = (0.1, 100.0)
+    time_fourier_freqs: tuple[float, float] = (0.1, 100.0)
+    diff_fourier_freqs: tuple[float, float] = (0.1, 100.0)
     depth: int = 4
-
-    img_mean: float = 0.5
-    img_std: float = 0.5
-    loss_weight_pow: float = 0.0
-
-    solver: str = "heun"
-    noise_ratio: float = 0.1
-    sampling_steps: int = 32
+    use_adaln: bool = True
 
 
-@dataclass
-class Config:
+class Config(BaseModel):
     use_wandb: bool = False
-    savedir: str = str(Path(__file__).parent / "data/vector_flow")
+    savedir: str = str(Path(__file__).parent / "data/meanflow")
 
-    model: FlowConfig = field(default_factory=FlowConfig)
+    net: MLPConfig = Field(default_factory=MLPConfig)
+    flow: FlowConfig = Field(default_factory=FlowConfig)
+
     do_compile: bool = False
     n_steps: int = 1_000
-    valid_every: int | None = 1000
+    valid_every: int | None = 250
     batch_size: int = 8192
 
     use_muon: bool = True
@@ -73,214 +82,211 @@ def make_embedding(num_embeddings: int, embedding_dim: int):
     return embed
 
 
-class ConditionalMLPBlock(nn.Module):
+class GatedMLPBlock(nn.Module):
     def __init__(self, dim: int, mlp_dim: int):
         super().__init__()
         self.norm = RMSNorm(dim, affine=False)
+        self.modulation = FusedLinear(dim, dim, zero_init=True)
         self.k = FusedLinear(dim, mlp_dim)
-        self.wc = FusedLinear(dim, dim, zero_init=True)
         self.act = nn.SiLU()
         self.v = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
 
     def forward(self, x, c):
-        scores = self.k(self.norm(x) * (1 + self.wc(self.norm(c))))
+        gate = self.modulation(self.norm(c))
+        scores = self.k(self.norm(x) * (1 + gate))
         scores = self.act(scores)
-        return self.v(scores)
+        return x + self.v(scores)
 
 
-class FlatTrigflow(nn.Module):
-    """A modified version of trigflow for t in [0, 1]. Designed for flat vector data."""
-
-    def __init__(
-        self,
-        dim: int,
-        mlp_dim: int,
-        data_dim: int,
-        depth: int,
-        min_freq: float,
-        max_freq: float,
-        freq_dim: int,
-        loss_weight_pow: float,
-    ):
-        """
-        Args:
-            dim: dimensionality of main path
-            mlp_dim: dimensionality of the MLP blocks' hidden activations
-            data_dim: dimensionality of the input
-            depth: number of MLP blocks. total # of linear layers = 2 * depth + 2
-            min_freq: minimum frequency of the sinusoidal embedding for time
-                suggested: value between 1 and 2pi
-            max_freq: maximum frequency of the sinusoidal embedding for time
-                suggested: 100 * min_freq
-            freq_dim: dimensionality of the sinusoidal embedding for time
-                suggested: a power of two >= 256
-        """
-
+class AdaLNMLPBlock(nn.Module):
+    def __init__(self, dim: int, mlp_dim: int):
         super().__init__()
         self.dim = dim
-        self.mlp_dim = mlp_dim
-        self.data_dim = data_dim
-        self.loss_weight_pow = loss_weight_pow
 
-        self.freqs = nn.Parameter(
-            min_freq * ((max_freq / min_freq) ** torch.linspace(0, 1, freq_dim))
+        self.norm = RMSNorm(dim)
+        self.modulation = FusedLinear(dim, 3 * dim, zero_init=True)
+        self.k = FusedLinear(dim, mlp_dim)
+        self.act = nn.SiLU()
+        self.v = FusedLinear(mlp_dim, dim)
+
+    def forward(self, x, c):
+        gate, shift, scale = self.modulation(self.norm(c)).chunk(3, dim=-1)
+        scores = self.k(self.norm(x) * (1.0 + gate) + shift)
+        scores = self.act(scores)
+        return x + self.v(scores) * scale
+
+
+def make_frequencies(freq_range: tuple[float, float], dim: int):
+    min_freq, max_freq = freq_range
+    return min_freq * ((max_freq / min_freq) ** torch.linspace(0, 1, dim))
+
+
+def fourier_embed(t: Tensor, freqs: Tensor) -> Tensor:
+    """Sinusoidal embedding for time. Expects input of shape (..., 1)"""
+    assert t.size(-1) == 1
+    thetas = t.float() * freqs.float()
+    return torch.cat([thetas.sin(), thetas.cos()], dim=-1)
+
+
+class SimpleMLPNet(nn.Module):
+    def __init__(self, cfg: MLPConfig):
+        super().__init__()
+        # self.in_proj = nn.Sequential(
+        #     RMSNorm(cfg.data_dim), FusedLinear(cfg.data_dim, cfg.dim)
+        # )
+        self.in_proj = FusedLinear(cfg.data_dim, cfg.dim)
+
+        # self.norm_freqs = nn.Buffer(
+        #     make_frequencies(cfg.norm_fourier_freqs, cfg.freq_dim)
+        # )
+        self.time_freqs = nn.Buffer(
+            make_frequencies(cfg.time_fourier_freqs, cfg.freq_dim)
         )
-        self.in_proj = FusedLinear(data_dim, dim, bias=True)
-        self.t_proj = FusedLinear(freq_dim * 2, dim)
+        self.diff_freqs = nn.Buffer(
+            make_frequencies(cfg.diff_fourier_freqs, cfg.freq_dim)
+        )
+        # self.emb_proj = FusedLinear(cfg.freq_dim * 6, cfg.dim)
+        self.emb_proj = FusedLinear(cfg.freq_dim * 4, cfg.dim)
+
+        block_type = AdaLNMLPBlock if cfg.use_adaln else GatedMLPBlock
         self.blocks = nn.ModuleList(
-            [ConditionalMLPBlock(dim, mlp_dim) for _ in range(depth)]
+            [block_type(cfg.dim, cfg.mlp_dim) for _ in range(cfg.depth)]
         )
-        self.out_head = nn.Sequential(
-            RMSNorm(dim, affine=False), FusedLinear(dim, data_dim, zero_init=True)
+
+        self.out_head = make_output_head(cfg.dim, cfg.data_dim)
+
+    def forward(self, input_ND, r_N1, t_N1, cond_ND):
+        x_ND = self.in_proj(input_ND)
+        r_N1 = r_N1.expand(x_ND.shape[:-1] + (1,))
+        t_N1 = t_N1.expand(x_ND.shape[:-1] + (1,))
+        emb = torch.cat(
+            [
+                # fourier_embed(x_ND.pow(2).mean(dim=-1, keepdim=True), self.norm_freqs),
+                fourier_embed(t_N1, self.time_freqs),
+                fourier_embed(t_N1 - r_N1, self.diff_freqs),
+            ],
+            dim=-1,
         )
-        self.out_head[-1].weight._is_output = True
-
-    def time_embed(self, t: Tensor) -> Tensor:
-        """Sinusoidal embedding for time. Expects input of shape (..., 1)"""
-        assert t.size(-1) == 1
-        thetas = t.float() * self.freqs.float()
-        return torch.cat([thetas.sin(), thetas.cos()], dim=-1)
-
-    def loss(self, inputs: Tensor, cond: Tensor) -> Tensor:
-        assert inputs.size(-1) == self.data_dim
-        assert cond.size(-1) == self.dim
-        device, dtype = inputs.device, inputs.dtype
-
-        t = torch.sigmoid(torch.randn(inputs.shape[:-1] + (1,), device=device))
-        s = t * (torch.pi / 2)
-
-        x1 = inputs.float()
-        z = torch.randn_like(x1)
-        xt = torch.sin(s) * x1 + torch.cos(s) * z
-        vt = (torch.pi / 2) * (torch.cos(s) * x1 - torch.sin(s) * z)
-
-        pt = self(xt.type(dtype), t, cond)
-
-        loss = (pt - vt).pow(2)
-        w = (loss.detach().mean(dim=-1, keepdim=True) + 1e-3) ** -self.loss_weight_pow
-        return w * loss
-
-    def forward(self, xt: Tensor, t: Tensor, c: Tensor) -> Tensor:
-        h = self.in_proj(xt * t.pow(0.5).type_as(xt))
-        # h = self.in_proj(xt)
-        t_emb = self.t_proj(self.time_embed(t).type_as(h))
-        c = c + t_emb
+        emb = emb.type_as(x_ND)
+        c_ND = self.emb_proj(emb) + cond_ND
         for block in self.blocks:
-            h = h + block(h, c)
-        return self.out_head(h).float()
+            x_ND = block(x_ND, c_ND)
+        return self.out_head(x_ND)
 
-    def clamp_velocity(self, xt, vt, s, minval: float | None, maxval: float | None):
+
+class Meanflow(nn.Module):
+    def __init__(self, cfg: FlowConfig, net: nn.Module):
+        super().__init__()
+        self.cfg = cfg
+        self.net = net
+        self.latent_shape = cfg.sample_shape[:-1] + (2 * cfg.sample_shape[-1],)
+
+    def loss(self, inputs_ND: Tensor, cond_ND: Tensor) -> Tensor:
+        N, D = inputs_ND.shape
+        device, dtype = inputs_ND.device, inputs_ND.dtype
+
+        mid = torch.sigmoid(
+            self.cfg.lognorm_mu
+            + self.cfg.lognorm_std * torch.randn((N, 1), device=device)
+        )
+        diff = torch.rand((N, 1), device=device) * 1.5 / self.cfg.sampling_steps
+        r = (mid - diff / 2).clamp(min=0)
+        t = (mid + diff / 2).clamp(max=1)
+
+        x = inputs_ND.float()
+        e = torch.randn_like(x)
+
+        if self.cfg.schedule == "trig":
+            cos_t = torch.cos(torch.pi / 2 * t)
+            sin_t = torch.sin(torch.pi / 2 * t)
+            xt = cos_t * x + sin_t * e
+            vt = (torch.pi / 2) * (-sin_t * x + cos_t * e)
+        else:
+            assert self.cfg.schedule == "linear"
+            xt = (1 - t) * x + t * e
+            vt = -x + e
+
+        u, dudt = jvp(
+            self.net,
+            (xt.type(dtype), r, t, cond_ND),
+            (
+                vt.type(dtype),
+                torch.zeros_like(r),
+                torch.ones_like(t),
+                torch.zeros_like(cond_ND),
+            ),
+        )
+        u_tgt = vt - (t - r) * dudt.detach()
+        loss_distill = (u - u_tgt).pow(2)
+        weights = (loss_distill.detach().mean(dim=-1) + 1e-3).pow(
+            -self.cfg.loss_wt_power
+        )
+        loss_distill = loss_distill * weights.unsqueeze(-1)
+        loss = loss_distill
+
+        if self.cfg.consistency_steps > 0:
+            with torch.no_grad():
+                xs = xt
+                u_sum = 0
+                for i in range(self.cfg.consistency_steps):
+                    s1 = t - (t - r) * i / (self.cfg.consistency_steps + 1)
+                    s2 = t - (t - r) * (i + 1) / (self.cfg.consistency_steps + 1)
+                    us = self.net(xs.type(dtype), s2, s1, cond_ND)
+                    xs = xs - (s1 - s2) * us
+                    u_sum += us
+            loss_consistency = (u - u_sum).pow(2)
+            weights = (loss_consistency.detach().mean(dim=-1) + 1e-3).pow(
+                -self.cfg.loss_wt_power
+            )
+            loss_consistency = loss_consistency * weights.unsqueeze(-1)
+            metrics.push(
+                loss_distill=loss_distill.mean(),
+                loss_consistency=loss_consistency.mean(),
+            )
+            loss = loss + loss_consistency * self.cfg.loss_consistency_wt
+
+        return loss
+
+    def clamp_velocity(self, xt, vt, t, minval: float | None, maxval: float | None):
+        if self.cfg.schedule == "linear":
+            raise NotImplementedError
+
         if minval is None and maxval is None:
             return vt
-        if torch.cos(s) < 0.01:
+        cos_t = torch.cos(torch.pi / 2 * t)
+        sin_t = torch.sin(torch.pi / 2 * t)
+        if sin_t < 0.01:
             return vt
 
-        x1 = torch.sin(s) * xt + (2 / torch.pi) * torch.cos(s) * vt
-        x1 = torch.clamp(x1, minval, maxval)
-        vt = (torch.pi / 2) * (x1 - torch.sin(s) * xt) / torch.cos(s)
+        x0 = cos_t * xt - (2 / torch.pi) * sin_t * vt
+        x0 = x0.clamp(minval, maxval)
+        vt = (torch.pi / 2) * (cos_t * xt - x0) / sin_t
         return vt
 
     @torch.no_grad()
-    def sample(
-        self,
-        c: Tensor,
-        noise_ratio: float,
-        n_steps: int,
-        u: Tensor | None = None,
-        lam: float = 0.0,
-        minval: float | None = None,
-        maxval: float | None = None,
-        analytic_step: bool = True,
-        use_heun: bool = False,
-    ) -> Tensor:
-        """
-        Args:
-            c: conditioning input
-            noise_ratio: ratio of the amount of noise added to the progress per step.
-                In each step, we take a reverse step (from ta -> tc, removing noise),
-                then a forward step (from tc -> tb, adding noise back), akin to Langevin
-                dynamics. Set noise_ratio to 0 for deterministic sampling.
-            n_steps: total # of model evaluations
-            u: unconditional input (for classifier-free guidance)
-            lam: classifier-free guidance scale
-            minval: force samples to be above this value
-            maxval: force samples to be below this value
-            analytic_step: when True, the sampler leverages the fact that we know xt =
-                sin(s) x + cos(s) z and vt = pi/2 cos(s) x - pi/2 sin(s) z, so the
-                value of xt' for the next t' can be estimated by solving for x and z
-            use_heun: when True, two velocity estimates are averaged for each step
-        """
-        device, dtype = c.device, c.dtype
-
-        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn(c.shape[:-1] + (self.data_dim,), device=device)
-        noise_dt = noise_ratio / n_steps
-        do_guidance = (u is not None) and (lam != 0)
-
-        for i in range(n_steps):
-            ta = timesteps[i].view(1)
-            tb = timesteps[i + 1].view(1)
-            tc = (timesteps[i + 1].view(1) + noise_dt).clamp(max=1)
-            sa = ta * (torch.pi / 2)
-            sb = tb * (torch.pi / 2)
-            sc = tc * (torch.pi / 2)
-
-            va = self(xt.type(dtype), ta, c)
-            if do_guidance:
-                va_uncond = self(xt.type(dtype), ta, u)
-                va = va * (lam + 1.0) - va_uncond * lam
-            va = self.clamp_velocity(xt, va, sa, minval, maxval)
-
-            if analytic_step:
-                xc = torch.cos(sa - sc) * xt - (2 / torch.pi) * torch.sin(sa - sc) * va
-            else:
-                xc = xt + (tc - ta) * va
-
-            if use_heun:
-                vc = self(xc.type(dtype), tc, c)
-                if do_guidance:
-                    vc_uncond = self(vc.type(dtype), tc, u)
-                    vc = vc * (lam + 1.0) - vc_uncond * lam
-                vc = self.clamp_velocity(xc, vc, sc, minval, maxval)
-
-                if analytic_step:
-                    # Using heun with analytic_step=True is a bit sus.
-                    xc = torch.cos(sa - sc) * xt - (1 / torch.pi) * torch.sin(
-                        sa - sc
-                    ) * (va + vc)
-                else:
-                    xc = xt + 0.5 * (tc - ta) * (va + vc)
-
-            if sb < sc:
-                scale = sb.sin() / sc.sin()
-                extra_var = sb.cos().pow(2) - (sc.cos() * scale).pow(2)
-                xt = scale * xc + extra_var.sqrt() * torch.randn_like(xt)
-            else:
-                xt = xc
+    def sample(self, cond_input: Tensor) -> Tensor:
+        N = cond_input.shape[0]
+        xt = torch.randn((N,) + self.cfg.sample_shape, device=cond_input.device)
+        timesteps = torch.linspace(1, 0, self.cfg.sampling_steps + 1)
+        timesteps = timesteps.to(cond_input.device)[:, None]
+        for i in range(self.cfg.sampling_steps):
+            ut = self.net(xt, timesteps[i + 1], timesteps[i], cond_input)
+            ut = self.clamp_velocity(xt, ut, timesteps[i], -1.0, 1.0)
+            xt = xt - (timesteps[i] - timesteps[i + 1]) * ut
         return xt
 
 
 class MnistFlow(nn.Module):
-    def __init__(self, cfg: FlowConfig):
-        assert cfg.solver in ("analytic", "heun")
+    def __init__(self, cfg: Config):
         super().__init__()
-        self.cfg = cfg
-        self.flow = FlatTrigflow(
-            dim=cfg.dim,
-            mlp_dim=cfg.mlp_dim,
-            data_dim=28 * 28,
-            freq_dim=cfg.freq_dim,
-            depth=cfg.depth,
-            min_freq=cfg.min_freq,
-            max_freq=cfg.max_freq,
-            loss_weight_pow=cfg.loss_weight_pow,
-        )
-        self.class_embed = make_embedding(10, cfg.dim)
+        net = SimpleMLPNet(cfg.net)
+        self.flow = Meanflow(cfg.flow, net)
+        self.class_embed = make_embedding(10, cfg.net.dim)
 
     def forward(self, images_NHW, labels_N):
         images_N1HW = images_NHW.type(DTYPE) / 255.0
         imgs_ND = images_N1HW.flatten(1, -1)
-        imgs_ND = (imgs_ND - self.cfg.img_mean) / self.cfg.img_std
+        imgs_ND = imgs_ND * 2.0 - 1.0
 
         class_emb_ND = self.class_embed(labels_N).type(DTYPE)
 
@@ -291,15 +297,7 @@ class MnistFlow(nn.Module):
     @torch.no_grad()
     def generate(self, labels_N):
         class_emb_ND = self.class_embed(labels_N).type(DTYPE)
-        imgs_ND = self.flow.sample(
-            class_emb_ND,
-            noise_ratio=self.cfg.noise_ratio,
-            n_steps=self.cfg.sampling_steps,
-            minval=-self.cfg.img_mean / self.cfg.img_std,
-            maxval=(1 - self.cfg.img_mean) / self.cfg.img_std,
-            analytic_step=self.cfg.solver == "analytic",
-            use_heun=self.cfg.solver == "heun",
-        )
+        imgs_ND = self.flow.sample(class_emb_ND)
         return imgs_ND
 
 
@@ -332,7 +330,7 @@ class Trainer:
         self.train_loader = mnist_loader(
             train=True, batch_size=cfg.batch_size, device=self.device
         )
-        self.model = MnistFlow(cfg.model).to(self.device)
+        self.model = MnistFlow(cfg).to(self.device)
         if cfg.do_compile:
             self.model = torch.compile(self.model)
 
@@ -410,7 +408,7 @@ class Trainer:
         labels_N = torch.arange(10 * rows, device=self.device) // rows
         imgs_ND = self.model.generate(labels_N)
         imgs = rearrange(imgs_ND, "N (H W) -> N H W", H=28, W=28)
-        imgs = imgs * self.model.cfg.img_std + self.model.cfg.img_mean
+        imgs = imgs * 0.5 + 0.5
         imgs = imgs.clamp(0, 1) * 255
         imgs = imgs.type(torch.uint8)
         imgs = imgs.cpu().numpy()
@@ -448,7 +446,7 @@ class Trainer:
         for i in tqdm.trange(0, total, self.cfg.batch_size, desc="computing fid"):
             labels_N = torch.arange(i, i + self.cfg.batch_size, device=self.device) % 10
             imgs_ND = self.model.generate(labels_N)
-            imgs_ND = imgs_ND * self.model.cfg.img_std + self.model.cfg.img_mean
+            imgs_ND = imgs_ND * 0.5 + 0.5
             imgs_ND = imgs_ND.clamp(0, 1) * 2.0 - 1.0
             samples.append(imgs_ND)
 

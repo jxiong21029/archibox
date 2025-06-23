@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import einops
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -11,11 +12,14 @@ import torch.nn.functional as F
 import tqdm
 from einops import rearrange
 from PIL import Image
+from torch import Tensor
 
 from archibox.components import FusedLinear, RMSNorm
 from archibox.metrics import Metrics
 from archibox.mnist_gen.dataloading import mnist_loader
+from archibox.mnist_gen.fid import FID
 from archibox.muon import Muon
+from archibox.utils import parse_config
 
 log = logging.getLogger(__name__)
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
@@ -27,24 +31,29 @@ metrics = Metrics(enabled=False, use_wandb=False)
 
 @dataclass
 class FlowConfig:
-    patch_size: int = 8
-    dim: int = 512
-    mlp_dim: int = 1024
-    depth: int = 2
+    patch_size: int = 4
+    layer_downfactors: list[int] = field(default_factory=lambda: [1, 4, 1])
+    base_dim: int = 384
+    mlp_mult: float = 2.0
+    cond_dim: int = 512
 
-    freq_dim: int = 1024
-    min_freq: float = 2 * torch.pi
-    max_freq: float = 200 * torch.pi
+    use_rotary: bool = True
+
+    t_freq_dim: int = 512
+    t_min_freq: float = 2 * torch.pi
+    t_max_mult: float = 100
 
     img_mean: float = 0.5
     img_std: float = 0.5
 
-    churn_ratio: float = 0.2
-    sampling_steps: int = 512
+    noise_ratio: float = 0.1
+    sampling_steps: int = 32
+    solver: str = "heun"
 
 
 @dataclass
 class Config:
+    debug: bool = False
     use_wandb: bool = False
     savedir: str = str(Path(__file__).parent / "data/vit_flow")
 
@@ -52,7 +61,7 @@ class Config:
     do_compile: bool = True
     n_steps: int = 1_000
     valid_every: int | None = 200
-    batch_size: int = 8192
+    batch_size: int = 2048
 
     use_muon: bool = True
     muon_lr: float = 0.02
@@ -71,80 +80,109 @@ def make_embedding(num_embeddings: int, embedding_dim: int):
 
 
 class ConditionalMLPBlock(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int):
+    def __init__(self, dim: int, mlp_dim: int, cond_dim: int):
         super().__init__()
+        self.cond_norm = RMSNorm(cond_dim, affine=False)
+        self.cond_proj = FusedLinear(cond_dim, dim, zero_init=True)
         self.norm = RMSNorm(dim, affine=False)
-        self.wc = FusedLinear(dim, dim, zero_init=True)
         self.k = FusedLinear(dim, mlp_dim)
         self.act = nn.SiLU()
         self.v = FusedLinear(mlp_dim, dim, scale=True, zero_init=True)
 
     def forward(self, x, c):
-        scores = self.k(self.norm(x) * (1 + self.wc(self.norm(c))))
+        scores = self.k(self.norm(x) * (1 + self.cond_proj(self.cond_norm(c))))
         scores = self.act(scores)
         return self.v(scores)
 
 
 class Rotary2d(nn.Module):
-    def __init__(self, npatches: tuple[int, int], head_dim: int, base: float):
+    def __init__(
+        self, npatches: tuple[int, int], head_dim: int, min_freq: float, max_mult: float
+    ):
         super().__init__()
         self.nh, self.nw = npatches
-        freqs = (1 / base) ** torch.linspace(0, 1, head_dim // 4, dtype=torch.float32)
-        # Used during inference
-        self.freqs_d = nn.Buffer(freqs, persistent=False)
-        # Used during training
-        theta_HW1d = torch.cat(
-            [
-                torch.arange(self.nh).view(self.nh, 1, 1).expand(self.nh, self.nw, 1)
-                * freqs,
-                torch.arange(self.nw).view(1, self.nw, 1).expand(self.nh, self.nw, 1)
-                * freqs,
-            ],
-            dim=-1,
-        ).unsqueeze(-2)
-        assert theta_HW1d.shape == (self.nh, self.nw, 1, head_dim // 2)
-        self.cos_HW1d = nn.Buffer(torch.cos(theta_HW1d), persistent=False)
-        self.sin_HW1d = nn.Buffer(torch.sin(theta_HW1d), persistent=False)
+
+        phi = torch.rand(head_dim // 2) * torch.pi * 2
+        fh = (
+            torch.sin(phi)
+            * min_freq
+            * (max_mult ** torch.linspace(0, 1, head_dim // 2))
+        )
+        fw = (
+            torch.cos(phi)
+            * min_freq
+            * (max_mult ** torch.linspace(0, 1, head_dim // 2))
+        )
+
+        nh, nw = self.nh, self.nw
+        h = torch.linspace(-1, 1, nh).view(nh, 1, 1, 1).expand(nh, nw, 1, 1)
+        w = torch.linspace(-1, 1, nw).view(1, nw, 1, 1).expand(nh, nw, 1, 1)
+        theta = h * fh + w * fw
+
+        self.cos_HW1d = nn.Buffer(torch.cos(theta), persistent=False)
+        self.sin_HW1d = nn.Buffer(torch.sin(theta), persistent=False)
 
     def forward(self, x_NHWhd):
         """training rotary embedding (known sequence length, uses cached cos/sin)"""
         assert x_NHWhd.shape[1:3] == (self.nh, self.nw)
-        x1_NHWhd, x2_NHWhd = x_NHWhd.float().chunk(2, dim=-1)
-        o1_NHWhd = x1_NHWhd * self.cos_HW1d + x2_NHWhd * self.sin_HW1d
-        o2_NHWhd = x1_NHWhd * (-self.sin_HW1d) + x2_NHWhd * self.cos_HW1d
-        return torch.cat([o1_NHWhd, o2_NHWhd], dim=-1).type_as(x_NHWhd)
+        x1, x2 = x_NHWhd.float().chunk(2, dim=-1)
+        output_NHWhd = torch.cat(
+            [
+                x1 * self.cos_HW1d - x2 * self.sin_HW1d,
+                x1 * self.sin_HW1d + x2 * self.cos_HW1d,
+            ],
+            dim=-1,
+        )
+        return output_NHWhd.type_as(x_NHWhd)
 
 
 class EncoderBlock(nn.Module):
     def __init__(
         self,
         npatches: tuple[int, int],
+        downscale: int,
         dim: int,
-        mlp_dim: int,
+        mlp_mult: float,
+        cond_dim: int,
         head_dim: int,
-        rotary: Rotary2d | None,
+        rotary_min_freq: float,
+        rotary_max_mult: float,
     ):
         super().__init__()
         assert dim % head_dim == 0
-        self.nh, self.nw = npatches
+        assert npatches[0] % downscale == 0
+        assert npatches[1] % downscale == 0
+        self.downscale = downscale
+        self.nh = npatches[0] // downscale
+        self.nw = npatches[1] // downscale
         self.dim = dim
+        self.mlp_dim = round(dim * mlp_mult)
         self.head_dim = head_dim
-        self.nheads = dim // head_dim
-        self.rotary = rotary
+        self.nheads = self.dim // head_dim
 
         self.norm = RMSNorm(dim, affine=False)
         self.qkv_weight = nn.Parameter(torch.randn(3, dim, dim) / dim**0.5 / 2)
         self.qk_norm = RMSNorm(head_dim, affine=False)
+        self.rotary = Rotary2d(
+            (self.nh, self.nw), head_dim, rotary_min_freq, rotary_max_mult
+        )
         self.o_proj = FusedLinear(dim, dim, scale=True, zero_init=True)
-        self.mlp = ConditionalMLPBlock(dim, mlp_dim)
+        self.mlp = ConditionalMLPBlock(dim, self.mlp_dim, cond_dim)
 
     def forward(self, input_NHWD, cond_ND):
-        N, H, W, _ = input_NHWD.shape
-        assert H == self.nh and W == self.nw
+        N = input_NHWD.size(0)
+        x_NHWD = rearrange(
+            input_NHWD,
+            "N (nh dh) (nw dw) (d dd) -> N nh nw (dh dw d) dd",
+            dh=self.downscale,
+            dw=self.downscale,
+            dd=self.downscale,
+        ).mean(dim=-1)
+
         qkv_weight = self.qkv_weight.flatten(0, 1).type_as(input_NHWD)
         q_NHWhd, k_NHWhd, v_NHWhd = (
-            (self.norm(input_NHWD) @ qkv_weight.t())
-            .view(N, H, W, 3 * self.nheads, self.head_dim)
+            (self.norm(x_NHWD) @ qkv_weight.t())
+            .view(N, self.nh, self.nw, 3 * self.nheads, self.head_dim)
             .chunk(3, dim=3)
         )
         q_NHWhd, k_NHWhd = self.qk_norm(q_NHWhd), self.qk_norm(k_NHWhd)
@@ -152,28 +190,40 @@ class EncoderBlock(nn.Module):
             q_NHWhd, k_NHWhd = self.rotary(q_NHWhd), self.rotary(k_NHWhd)
 
         x_NhTd = F.scaled_dot_product_attention(
-            rearrange(q_NHWhd, "N H W h d -> N h (H W) d", H=H, W=W),
-            rearrange(k_NHWhd, "N H W h d -> N h (H W) d", H=H, W=W),
-            rearrange(v_NHWhd, "N H W h d -> N h (H W) d", H=H, W=W),
+            rearrange(q_NHWhd, "N H W h d -> N h (H W) d", H=self.nh, W=self.nw),
+            rearrange(k_NHWhd, "N H W h d -> N h (H W) d", H=self.nh, W=self.nw),
+            rearrange(v_NHWhd, "N H W h d -> N h (H W) d", H=self.nh, W=self.nw),
             is_causal=False,
         )
-        x_NHWD = rearrange(x_NhTd, "N h (H W) d -> N H W (h d)", H=H, W=W)
-        x_NHWD = input_NHWD + self.o_proj(x_NHWD)
-
+        x_NHWD = rearrange(x_NhTd, "N h (H W) d -> N H W (h d)", H=self.nh, W=self.nw)
+        x_NHWD = self.o_proj(x_NHWD)
         x_NHWD = x_NHWD + self.mlp(x_NHWD, cond_ND.unsqueeze(1).unsqueeze(2))
+
+        x_NHWD = einops.repeat(
+            x_NHWD,
+            "N nh nw (rh rw d) -> N (nh rh) (nw rw) (d dd)",
+            rh=self.downscale,
+            rw=self.downscale,
+            dd=self.downscale,
+        )
+        x_NHWD = input_NHWD + x_NHWD
+
         return x_NHWD
 
 
-class ViT(nn.Module):
+class VisionTransformer(nn.Module):
     def __init__(
         self,
         image_size: tuple[int, int],
         patch_size: tuple[int, int],
-        dim: int,
-        mlp_dim: int,
+        layer_downfactors: list[int],
+        base_dim: int,
+        mlp_mult: float,
+        cond_dim: int,
         head_dim: int,
-        depth: int,
-        rope_base: float,
+        use_rotary: bool,
+        rotary_min_freq: float = torch.pi / 2,
+        rotary_max_mult: float = 32.0,
     ):
         super().__init__()
         self.image_size = image_size
@@ -182,19 +232,32 @@ class ViT(nn.Module):
         self.nw = image_size[1] // patch_size[1]
 
         self.patchify_wt = nn.Parameter(
-            torch.randn(dim, patch_size[0] * patch_size[1])
+            torch.randn(base_dim, patch_size[0] * patch_size[1])
             / (2 * (patch_size[0] * patch_size[1]) ** 0.5)
         )
-        self.rotary = Rotary2d((self.nh, self.nw), head_dim, rope_base)
+        if use_rotary:
+            self.pos_emb = None
+        else:
+            self.pos_emb = nn.Parameter(torch.randn(self.nh, self.nw, base_dim) * 0.05)
+            self.pos_emb._is_embed = True
         self.blocks = nn.ModuleList(
             [
-                EncoderBlock((self.nh, self.nw), dim, mlp_dim, head_dim, self.rotary)
-                for _ in range(depth)
+                EncoderBlock(
+                    (self.nh, self.nw),
+                    down,
+                    base_dim,
+                    mlp_mult,
+                    cond_dim,
+                    head_dim,
+                    rotary_min_freq,
+                    rotary_max_mult,
+                )
+                for down in layer_downfactors
             ]
         )
         self.out_head = nn.Sequential(
-            RMSNorm(dim, affine=False),
-            FusedLinear(dim, patch_size[0] * patch_size[1]),
+            RMSNorm(base_dim, affine=False),
+            FusedLinear(base_dim, patch_size[0] * patch_size[1]),
         )
         self.out_head[-1].weight._is_output = True
 
@@ -205,6 +268,8 @@ class ViT(nn.Module):
             img_NHW, "N (nh ph) (nw pw) -> N nh nw (ph pw)", ph=ph, pw=pw
         )
         x_NHWD = x_NHWD @ self.patchify_wt.type_as(x_NHWD).t()
+        if self.pos_emb is not None:
+            x_NHWD = x_NHWD + self.pos_emb
 
         for block in self.blocks:
             x_NHWD = block(x_NHWD, cond_ND)
@@ -224,28 +289,30 @@ class MnistFlow(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        assert self.cfg.solver in ("heun", "analytic")
 
-        self.t_proj = FusedLinear(cfg.freq_dim * 2, cfg.dim)
-        self.class_embed = make_embedding(10, cfg.dim)
-        self.vit = ViT(
+        self.t_proj = FusedLinear(cfg.t_freq_dim * 2, cfg.cond_dim)
+        self.class_embed = make_embedding(10, cfg.cond_dim)
+        self.vit = VisionTransformer(
             (32, 32),
             (cfg.patch_size, cfg.patch_size),
-            dim=cfg.dim,
-            mlp_dim=cfg.mlp_dim,
+            layer_downfactors=cfg.layer_downfactors,
+            base_dim=cfg.base_dim,
+            mlp_mult=cfg.mlp_mult,
+            cond_dim=cfg.cond_dim,
             head_dim=64,
-            depth=cfg.depth,
-            rope_base=32.0,
+            use_rotary=cfg.use_rotary,
+        )
+        self.freqs = nn.Buffer(
+            self.cfg.t_min_freq
+            * (self.cfg.t_max_mult ** torch.linspace(0, 1, self.cfg.t_freq_dim))
         )
 
     def time_embed(self, t):
         assert t.size(-1) == 1
         assert t.amin() >= 0.0, f"{t.amin()=:.7f}"
         assert t.amax() <= 1.0, f"{t.amax()=:.7f}"
-        freqs = self.cfg.min_freq * (
-            (self.cfg.max_freq / self.cfg.min_freq)
-            ** torch.linspace(0, 1, self.cfg.freq_dim, device=t.device)
-        )
-        thetas = t.float() * freqs.float()
+        thetas = t.float() * self.freqs.float()
         return torch.cat([thetas.sin(), thetas.cos()], dim=-1)
 
     def loss(self, inputs_NHW, digits):
@@ -263,15 +330,14 @@ class MnistFlow(nn.Module):
         xt = torch.cos(s) * x0 + torch.sin(s) * x1
         vt = (-torch.sin(s) * x0 + torch.cos(s) * x1) * (torch.pi / 2)
 
-        pt = self(xt.type(DTYPE).view(N, H, W), t, digits).flatten(1, -1)
+        pt = self(xt.type(DTYPE), t, digits).flatten(1, -1)
 
         loss = (pt - vt).pow(2).mean()
         return loss
 
-    def forward(self, xt_NHW, t_N1, digits_N):
-        N = xt_NHW.size(0)
-        assert xt_NHW.shape[1:] == (28, 28)
-
+    def forward(self, xt_ND, t_N1, digits_N):
+        N = xt_ND.size(0)
+        xt_NHW = rearrange(xt_ND, "N (H W) -> N H W", H=28, W=28)
         xt_NHW = F.pad(xt_NHW, (2, 2, 2, 2))
         assert xt_NHW.shape == (N, 32, 32)
         t_emb_ND = self.t_proj(self.time_embed(t_N1).type(DTYPE))
@@ -281,51 +347,94 @@ class MnistFlow(nn.Module):
         output = output[..., 2:-2, 2:-2]
         return output
 
-    @torch.no_grad
-    def sample_heun(self, digits, n_steps: int = 50):
-        N = digits.size(0)
-        device = digits.device
+    def clamp_velocity(self, xt, vt, s, minval: float | None, maxval: float | None):
+        if minval is None and maxval is None:
+            return vt
+        if torch.cos(s) < 0.01:
+            return vt
+
+        x1 = torch.sin(s) * xt + (2 / torch.pi) * torch.cos(s) * vt
+        x1 = torch.clamp(x1, minval, maxval)
+        vt = (torch.pi / 2) * (x1 - torch.sin(s) * xt) / torch.cos(s)
+        return vt
+
+    @torch.no_grad()
+    def sample(
+        self,
+        c: Tensor,
+        noise_ratio: float,
+        n_steps: int,
+        u: Tensor | None = None,
+        lam: float = 0.0,
+        minval: float | None = None,
+        maxval: float | None = None,
+        analytic_step: bool = True,
+        use_heun: bool = False,
+    ) -> Tensor:
+        """
+        Args:
+            c: conditioning input
+            noise_ratio: ratio of the amount of noise added to the progress per step.
+                In each step, we take a reverse step (from ta -> tc, removing noise),
+                then a forward step (from tc -> tb, adding noise back), akin to Langevin
+                dynamics. Set noise_ratio to 0 for deterministic sampling.
+            n_steps: total # of model evaluations
+            u: unconditional input (for classifier-free guidance)
+            lam: classifier-free guidance scale
+            minval: force samples to be above this value
+            maxval: force samples to be below this value
+            analytic_step: when True, the sampler leverages the fact that we know xt =
+                sin(s) x + cos(s) z and vt = pi/2 cos(s) x - pi/2 sin(s) z, so the
+                value of xt' for the next t' can be estimated by solving for x and z
+            use_heun: when True, two velocity estimates are averaged for each step
+        """
+        device = c.device
 
         timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn((N, 28 * 28), device=device)
+        xt = torch.randn(c.shape + (28 * 28,), device=device)
+        noise_dt = noise_ratio / n_steps
+        do_guidance = (u is not None) and (lam != 0)
 
         for i in range(n_steps):
             ta = timesteps[i].view(1)
             tb = timesteps[i + 1].view(1)
-
-            va = self(xt.type(DTYPE).view(N, 28, 28), ta, digits).flatten(1, -1)
-            xb = xt + (tb - ta) * va
-            vb = self(xb.type(DTYPE).view(N, 28, 28), tb, digits).flatten(1, -1)
-
-            xt = xt + (tb - ta) * (va + vb) / 2
-        return xt
-
-    @torch.no_grad
-    def sample_analytic(self, digits, churn_ratio: float, n_steps: int = 50):
-        N = digits.size(0)
-        device = digits.device
-
-        timesteps = torch.linspace(0, 1, n_steps + 1, device=device)
-        xt = torch.randn((N, 28 * 28), device=device)
-        churn_dt = churn_ratio / n_steps
-
-        for i in range(n_steps):
-            ta = timesteps[i].view(1)
-            tb = timesteps[i + 1].view(1)
-            tA = (ta - churn_dt).clamp(min=0)
+            tc = (timesteps[i + 1].view(1) + noise_dt).clamp(max=1)
             sa = ta * (torch.pi / 2)
             sb = tb * (torch.pi / 2)
-            sA = tA * (torch.pi / 2)
+            sc = tc * (torch.pi / 2)
 
-            if tA < ta:
-                scale = sA.sin() / sa.sin()
-                extra_var = sA.cos().pow(2) - (sa.cos() * scale).pow(2)
-                xA = scale * xt + extra_var.sqrt() * torch.randn_like(xt)
+            va = self(xt.type(DTYPE), ta, c).flatten(-2, -1)
+            if do_guidance:
+                va_uncond = self(xt.type(DTYPE), ta, u).flatten(-2, -1)
+                va = va * (lam + 1.0) - va_uncond * lam
+            va = self.clamp_velocity(xt, va, sa, minval, maxval)
+
+            if analytic_step:
+                xc = torch.cos(sa - sc) * xt - (2 / torch.pi) * torch.sin(sa - sc) * va
             else:
-                xA = xt
+                xc = xt + (tc - ta) * va
 
-            vA = self(xA.type(DTYPE).view(N, 28, 28), tA, digits).flatten(1, -1)
-            xt = torch.cos(sA - sb) * xA - (2 / torch.pi) * torch.sin(sA - sb) * vA
+            if use_heun:
+                vc = self(xc.type(DTYPE), tc, c).flatten(-2, -1)
+                if do_guidance:
+                    vc_uncond = self(vc.type(DTYPE), tc, u).flatten(-2, -1)
+                    vc = vc * (lam + 1.0) - vc_uncond * lam
+                vc = self.clamp_velocity(xc, vc, sc, minval, maxval)
+
+                if analytic_step:
+                    # Using heun with analytic_step=True is a bit sus.
+                    xc = torch.cos(sa - sc) * xt - (1 / torch.pi) * torch.sin(
+                        sa - sc
+                    ) * (va + vc)
+                else:
+                    xc = xt + 0.5 * (tc - ta) * (va + vc)
+
+            if sb < sc:
+                scale = sb.sin() / sc.sin()
+                extra_var = sb.cos().pow(2) - (sc.cos() * scale).pow(2)
+                xt = scale * xc + extra_var.sqrt() * torch.randn_like(xt)
+            else:
+                xt = xc
         return xt
 
 
@@ -414,6 +523,9 @@ class Trainer:
 
         self.step = 0
 
+        self.fid = FID.from_pretrained()
+        self.fid.model.to(self.device)
+
     def log_once(self, s, level=logging.INFO):
         if self.is_main_process:
             log.log(level, s)
@@ -445,7 +557,7 @@ class Trainer:
         for optim in self.optims:
             optim.zero_grad(set_to_none=True)
 
-    @torch.no_grad
+    @torch.no_grad()
     def valid_epoch(self):
         self.model.eval()
         metrics.context = "valid_"
@@ -456,12 +568,16 @@ class Trainer:
 
         rows = 5
         # Generate and save samples
-        labels_N = torch.arange(10 * rows, device=self.device) // rows
-        imgs_ND = self.model.sample_analytic(
-            labels_N,
-            churn_ratio=self.model.cfg.churn_ratio,
-            n_steps=self.model.cfg.sampling_steps,
+        kwargs = dict(
+            noise_ratio=self.cfg.model.noise_ratio,
+            n_steps=self.cfg.model.sampling_steps,
+            minval=-self.cfg.model.img_mean / self.cfg.model.img_std,
+            maxval=(1 - self.cfg.model.img_mean) / self.cfg.model.img_std,
+            analytic_step=self.cfg.model.solver == "analytic",
+            use_heun=self.cfg.model.solver == "heun",
         )
+        labels_N = torch.arange(10 * rows, device=self.device) // rows
+        imgs_ND = self.model.sample(labels_N, **kwargs)
         imgs = rearrange(imgs_ND, "N (H W) -> N H W", H=28, W=28)
         imgs = imgs * self.model.cfg.img_std + self.model.cfg.img_mean
         imgs = imgs.clamp(0, 1) * 255
@@ -494,28 +610,34 @@ class Trainer:
             truth = rearrange(truth, "(D M) H W -> (M H) (D W)", D=10)
             Image.fromarray(truth).save(Path(__file__).parent / "data/truth.png")
 
-        # Compute FID-like metric based on distribution of # pixels on per image
-        total = 10_000
-        counts = [0 for _ in range(19)]
-        for i in range(0, total, self.cfg.batch_size):
+        # FID-like metric(s)
+        total = 50_000
+        samples = []
+        counts_histogram = [0 for _ in range(19)]
+        for i in tqdm.trange(0, total, self.cfg.batch_size, desc="computing fid"):
             labels_N = torch.arange(i, i + self.cfg.batch_size, device=self.device) % 10
-            imgs_ND = self.model.sample_analytic(
-                labels_N,
-                churn_ratio=self.model.cfg.churn_ratio,
-                n_steps=self.model.cfg.sampling_steps,
-            )
+            imgs_ND = self.model.sample(labels_N, **kwargs)
             imgs_ND = imgs_ND * self.model.cfg.img_std + self.model.cfg.img_mean
-            num_on_N = (imgs_ND.clamp(0, 1) > 0.1).long().sum(dim=1)
-            num_on_N = num_on_N // 16
-            for n in num_on_N.cpu().numpy():
-                counts[min(n, 18)] += 1
-        counts = np.array(counts)
-        fracs = counts / counts.sum()
-        ref_fracs = np.load(Path(__file__).parent / "data/ratios.npy")
-        distance = np.abs(fracs - ref_fracs).mean()
-        metrics.push(pixel_counts_distance=distance)
-        metrics.report()
+            imgs_ND = imgs_ND.clamp(0, 1) * 2.0 - 1.0
+            samples.append(imgs_ND)
 
+            n_pixels_on = (imgs_ND > 0.1).long().sum(dim=1) // 16
+            for n in n_pixels_on.cpu().numpy():
+                counts_histogram[min(n, 18)] += 1
+
+        # Metric based on MLP features
+        samples_ND = torch.cat(samples)
+        fid = self.fid.compute_fid(samples_ND)
+        metrics.push(mlp_fid=fid)
+
+        # Metric based on distribution of # of pixels enabled per image
+        counts_histogram = np.array(counts_histogram)
+        counts_histogram = counts_histogram / counts_histogram.sum()
+        reference_hist = np.load(Path(__file__).parent / "data/ratios.npy")
+        histogram_dist = np.abs(counts_histogram - reference_hist).mean()
+        metrics.push(hist_fid=histogram_dist)
+
+        metrics.report()
         self.model.train()
         metrics.context = "train_"
 
@@ -539,17 +661,11 @@ class Trainer:
                 progress_bar.update(1)
 
 
-def main():
-    import argparse
+# TODO: update to the other version...
+@parse_config
+def main(cfg: Config):
+    logging.basicConfig(level=logging.DEBUG if cfg.debug else logging.INFO)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--churn_ratio", type=float, default=3.0)
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
-
-    cfg = Config(model=FlowConfig(churn_ratio=args.churn_ratio))
     try:
         trainer = Trainer(cfg)
         trainer.run()
