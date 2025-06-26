@@ -1,6 +1,5 @@
 import logging
 import os
-import random
 from pathlib import Path
 from typing import Literal
 
@@ -8,26 +7,27 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torchvision.transforms.v2 as T
 import tqdm
+from bnnp import Metrics, parse_config
+from bnnp.nn import FusedLinear, Output, RMSNorm
 from einops import rearrange
 from PIL import Image
 from pydantic import BaseModel, Field
 from torch import Tensor
 from torch.func import jvp
+from torch.utils.data import TensorDataset
+from torchvision.datasets import MNIST
 
-from archibox.components import FusedLinear, RMSNorm, make_output_head
-from archibox.metrics import Metrics
-from archibox.mnist_gen.dataloading import mnist_loader
 from archibox.mnist_gen.fid import FID
-from archibox.muon import Muon, split_muon_adamw_params
-from archibox.utils import parse_config
+from archibox.trainer import Trainer, TrainerConfig
 
 log = logging.getLogger(__name__)
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
     DTYPE = torch.bfloat16
 else:
     DTYPE = torch.float32
-metrics = Metrics(enabled=False, use_wandb=False)
+metrics = Metrics(enabled=False, use_wandb=False, use_cuda_events=True)
 
 
 class FlowConfig(BaseModel):
@@ -39,7 +39,7 @@ class FlowConfig(BaseModel):
     loss_consistency_wt: float = 0.0
 
     sample_shape: list[int] = (28 * 28,)
-    sampling_steps: int = 64
+    sampling_steps: int = 32
 
 
 class MLPConfig(BaseModel):
@@ -54,24 +54,33 @@ class MLPConfig(BaseModel):
     use_adaln: bool = True
 
 
+SAVEDIR = Path(__file__).parent / "data/meanflow"
+
+
 class Config(BaseModel):
     use_wandb: bool = False
-    savedir: str = str(Path(__file__).parent / "data/meanflow")
 
     net: MLPConfig = Field(default_factory=MLPConfig)
     flow: FlowConfig = Field(default_factory=FlowConfig)
-
-    do_compile: bool = False
-    n_steps: int = 1_000
-    valid_every: int | None = 250
-    batch_size: int = 8192
-
-    use_muon: bool = True
-    muon_lr: float = 0.02
-    adamw_lr: float = 0.003
-    wd: float = 0.01
-    lr_cooldown_start: int | None = None
-    lr_cooldown_ratio: float = 0.0
+    trainer: TrainerConfig = Field(
+        default_factory=lambda: TrainerConfig(
+            run_dir=None,
+            n_steps=1_000,
+            valid_every=250,
+            save_every=None,
+            micro_batch_size=8192,
+            train_loader_workers=0,
+            valid_loader_workers=0,
+            muon_lr=0.02,
+            muon_wd=0.01,
+            scalar_lr=0.003,
+            embeds_lr=0.003,
+            output_lr=0.003,
+            adamw_wd=0.01,
+            adamw_mu1=0.9,
+            adamw_mu2=0.99,
+        )
+    )
 
 
 def make_embedding(num_embeddings: int, embedding_dim: int):
@@ -131,9 +140,6 @@ def fourier_embed(t: Tensor, freqs: Tensor) -> Tensor:
 class SimpleMLPNet(nn.Module):
     def __init__(self, cfg: MLPConfig):
         super().__init__()
-        # self.in_proj = nn.Sequential(
-        #     RMSNorm(cfg.data_dim), FusedLinear(cfg.data_dim, cfg.dim)
-        # )
         self.in_proj = FusedLinear(cfg.data_dim, cfg.dim)
 
         # self.norm_freqs = nn.Buffer(
@@ -153,7 +159,7 @@ class SimpleMLPNet(nn.Module):
             [block_type(cfg.dim, cfg.mlp_dim) for _ in range(cfg.depth)]
         )
 
-        self.out_head = make_output_head(cfg.dim, cfg.data_dim)
+        self.out_head = Output(cfg.dim, cfg.data_dim, pad_to=64)
 
     def forward(self, input_ND, r_N1, t_N1, cond_ND):
         x_ND = self.in_proj(input_ND)
@@ -283,7 +289,9 @@ class MnistFlow(nn.Module):
         self.flow = Meanflow(cfg.flow, net)
         self.class_embed = make_embedding(10, cfg.net.dim)
 
-    def forward(self, images_NHW, labels_N):
+    def forward(self, batch):
+        images_NHW, labels_N = batch
+
         images_N1HW = images_NHW.type(DTYPE) / 255.0
         imgs_ND = images_N1HW.flatten(1, -1)
         imgs_ND = imgs_ND * 2.0 - 1.0
@@ -301,108 +309,8 @@ class MnistFlow(nn.Module):
         return imgs_ND
 
 
-class Trainer:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-        self.rank = int(os.environ.get("RANK", "0"))
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        self.is_main_process = self.rank == 0
-        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        self.device = torch.device("cuda", local_rank)
-        torch.cuda.set_device(self.device)
-        if self.world_size > 1:
-            dist.init_process_group(backend="nccl", device_id=self.device)
-
-        log.info(f"using {DTYPE=}")
-        random.seed(self.rank)
-        np.random.seed(self.rank)
-        torch.manual_seed(self.rank)
-        torch.cuda.manual_seed(self.rank)
-
-        metrics.enabled = self.is_main_process
-        metrics.use_wandb = cfg.use_wandb
-        metrics.context = "train_"
-
-        dataset_path = Path(__file__).parent / "data"
-        dataset_path.mkdir(exist_ok=True)
-
-        self.train_loader = mnist_loader(
-            train=True, batch_size=cfg.batch_size, device=self.device
-        )
-        self.model = MnistFlow(cfg).to(self.device)
-        if cfg.do_compile:
-            self.model = torch.compile(self.model)
-
-        muon_params, scalar_params, embeds_params, output_params = (
-            split_muon_adamw_params(self.model, verbose=True)
-        )
-
-        self.optims = []
-        if len(muon_params) > 0:
-            muon = Muon(
-                muon_params,
-                lr=self.cfg.muon_lr,
-                momentum=0.9,
-                weight_decay=self.cfg.wd,
-            )
-            self.optims.append(muon)
-        adamw = torch.optim.AdamW(
-            scalar_params + embeds_params + output_params,
-            lr=self.cfg.adamw_lr,
-            betas=[0.9, 0.99],
-            weight_decay=self.cfg.wd,
-        )
-        self.optims.append(adamw)
-        for opt in self.optims:
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
-
-        self.step = 0
-
-        self.fid = FID.from_pretrained()
-        self.fid.model.to(self.device)
-
-    def log_once(self, s, level=logging.INFO):
-        if self.is_main_process:
-            log.log(level, s)
-
-    def schedule_lr(self):
-        if (
-            self.cfg.lr_cooldown_start is not None
-            and self.step >= self.cfg.lr_cooldown_start
-        ):
-            frac = (self.step - self.cfg.lr_cooldown_start + 1) / (
-                self.cfg.n_steps - self.cfg.lr_cooldown_start
-            )
-            relative_lr = 1.0 - (1 - self.cfg.lr_cooldown_ratio) * min(1.0, frac)
-            for opt in self.optims:
-                for group in opt.param_groups:
-                    group["lr"] = group["initial_lr"] * relative_lr
-        else:
-            relative_lr = 1.0
-        metrics.push(relative_lr=relative_lr)
-
-    def train_step(self):
-        self.schedule_lr()
-
-        images, labels = next(self.train_loader)
-        loss = self.model(images, labels)
-        loss.backward()
-        for optim in self.optims:
-            optim.step()
-        for optim in self.optims:
-            optim.zero_grad(set_to_none=True)
-
-    @torch.no_grad()
-    def valid_epoch(self):
-        self.model.eval()
-        metrics.context = "valid_"
-        for images, labels in mnist_loader(
-            train=False, batch_size=self.cfg.batch_size, epochs=1, device=self.device
-        ):
-            self.model(images, labels)
-
+class MnistFlowTrainer(Trainer):
+    def on_validation_end(self):
         rows = 5
         # Generate and save samples
         labels_N = torch.arange(10 * rows, device=self.device) // rows
@@ -413,38 +321,23 @@ class Trainer:
         imgs = imgs.type(torch.uint8)
         imgs = imgs.cpu().numpy()
 
-        savedir = Path(self.cfg.savedir)
-        savedir.mkdir(exist_ok=True)
+        SAVEDIR.mkdir(exist_ok=True)
         if self.step > 0:
-            savepath = savedir / f"samples_step_{self.step + 1}.png"
+            savepath = SAVEDIR / f"samples_step_{self.step + 1}.png"
         else:
-            savepath = savedir / "samples_initial.png"
+            savepath = SAVEDIR / "samples_initial.png"
 
         imgs = rearrange(imgs, "(D M) H W -> (M H) (D W)", D=10)
         Image.fromarray(imgs).save(savepath)
-
-        if self.step == 0:
-            truth = {c: [] for c in range(10)}
-            count = 0
-            for img, label in mnist_loader(
-                train=False, batch_size=1, epochs=1, device="cpu"
-            ):
-                if len(truth[int(label)]) < rows:
-                    truth[int(label)].append(img.squeeze(0).numpy())
-                    count += 1
-                    if count == 10 * rows:
-                        break
-            truth = [truth[c][i] for c in range(10) for i in range(rows)]
-            truth = np.array(truth)
-            truth = rearrange(truth, "(D M) H W -> (M H) (D W)", D=10)
-            Image.fromarray(truth).save(Path(__file__).parent / "data/truth.png")
 
         # FID-like metric(s)
         total = 50_000
         samples = []
         counts_histogram = [0 for _ in range(19)]
-        for i in tqdm.trange(0, total, self.cfg.batch_size, desc="computing fid"):
-            labels_N = torch.arange(i, i + self.cfg.batch_size, device=self.device) % 10
+        for i in tqdm.trange(0, total, self.cfg.micro_batch_size, desc="computing fid"):
+            labels_N = (
+                torch.arange(i, i + self.cfg.micro_batch_size, device=self.device) % 10
+            )
             imgs_ND = self.model.generate(labels_N)
             imgs_ND = imgs_ND * 0.5 + 0.5
             imgs_ND = imgs_ND.clamp(0, 1) * 2.0 - 1.0
@@ -456,45 +349,53 @@ class Trainer:
 
         # Metric based on MLP features
         samples_ND = torch.cat(samples)
-        fid = self.fid.compute_fid(samples_ND)
-        metrics.push(mlp_fid=fid)
+
+        fid_model = FID.from_pretrained()
+        fid = fid_model.compute_fid(samples_ND)
+        self.metrics.push(mlp_fid=fid)
 
         # Metric based on distribution of # of pixels enabled per image
         counts_histogram = np.array(counts_histogram)
         counts_histogram = counts_histogram / counts_histogram.sum()
         reference_hist = np.load(Path(__file__).parent / "data/ratios.npy")
         histogram_dist = np.abs(counts_histogram - reference_hist).mean()
-        metrics.push(hist_fid=histogram_dist)
+        self.metrics.push(hist_fid=histogram_dist)
 
-        metrics.report()
-        self.model.train()
-        metrics.context = "train_"
-
-    def run(self):
-        with tqdm.tqdm(total=self.cfg.n_steps, desc="training") as progress_bar:
-            if self.step == 0:
-                self.log_once("running initial validation epoch")
-                self.valid_epoch()
-            else:
-                progress_bar.update(self.step)
-            while self.step < self.cfg.n_steps:
-                self.train_step()
-
-                if (
-                    self.cfg.valid_every is not None
-                    and (self.step + 1) % self.cfg.valid_every == 0
-                ) or self.step + 1 == self.cfg.n_steps:
-                    self.valid_epoch()
-
-                self.step += 1
-                progress_bar.update(1)
+    def on_epoch_end(self):
+        pass
 
 
 @parse_config
 def main(cfg: Config):
     logging.basicConfig(level=logging.INFO)
+
+    model = MnistFlow(cfg)
+
+    mnist_train = MNIST(
+        Path(__file__).parent / "data", train=True, download=True, transform=T.ToImage()
+    )
+    mnist_valid = MNIST(
+        Path(__file__).parent / "data",
+        train=True,
+        download=True,
+        transform=T.ToImage(),
+    )
+
+    # For MNIST, transfer entire dataset to GPU beforehand for speed.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device("cuda", local_rank)
+    train_dataset = TensorDataset(
+        mnist_train.data.to(device), mnist_train.targets.to(device)
+    )
+    valid_dataset = TensorDataset(
+        mnist_valid.data.to(device), mnist_valid.targets.to(device)
+    )
+
     try:
-        trainer = Trainer(cfg)
+        trainer = MnistFlowTrainer(
+            cfg.trainer, model, train_dataset, valid_dataset, metrics
+        )
+
         trainer.run()
     finally:
         if dist.is_initialized():
