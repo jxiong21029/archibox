@@ -17,7 +17,6 @@ Future considerations:
 
 import logging
 import os
-import random
 from pathlib import Path
 
 import einops
@@ -29,15 +28,15 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import tqdm
-from bnnp import Metrics, Muon, auto_split_muon_params, parse_config
+from bnnp import Metrics, parse_config
 from bnnp.nn import FusedLinear, Output
 from einops import rearrange
 from pydantic import BaseModel, Field
-from torchvision.transforms import v2
+from torch.utils.data import TensorDataset
+from torchvision.datasets import MNIST
 
 from archibox.foveation.multirotary import MultiRotaryDecoder
-from archibox.mnist_gen.dataloading import mnist_loader
+from archibox.trainer import Trainer, TrainerConfig
 from archibox.utils import save_frames_to_gif, save_frames_to_mp4
 
 matplotlib.use("agg")
@@ -66,20 +65,26 @@ class ModelConfig(BaseModel):
 
 
 class Config(BaseModel):
-    use_wandb: bool = False
     model: ModelConfig = Field(default_factory=ModelConfig)
-
-    do_compile: bool = False
-    n_steps: int = 1000
-    valid_every: int | None = 250
-    batch_size: int = 2048
-    do_augment: bool = True
-
-    muon_lr: float = 0.01
-    adamw_lr: float = 0.0005
-    wd: float = 0.01
-    lr_cooldown_start: int | None = None
-    lr_cooldown_ratio: float = 0.0
+    trainer: TrainerConfig = Field(
+        default_factory=lambda: TrainerConfig(
+            run_dir=None,
+            n_steps=1_000,
+            valid_every=250,
+            save_every=None,
+            micro_batch_size=2048,
+            train_loader_workers=0,
+            valid_loader_workers=0,
+            muon_lr=0.01,
+            muon_wd=0.01,
+            scalar_lr=0.0005,
+            embeds_lr=0.0005,
+            output_lr=0.0005,
+            adamw_wd=0.01,
+            adamw_mu1=0.9,
+            adamw_mu2=0.99,
+        )
+    )
 
 
 class FourierEmbed(nn.Module):
@@ -324,7 +329,9 @@ class FoveatedMnist(nn.Module):
         patch_idx = torch.cat(all_patch_idx, dim=1)
         return class_logits, patch_logits, patch_idx
 
-    def forward(self, images_NHW, labels_N):
+    def forward(self, batch):
+        images_NHW, labels_N = batch
+
         N, H, W = images_NHW.shape
         T = self.cfg.seq_len
         n_uniform = round(N * self.cfg.p_uniform)
@@ -386,123 +393,12 @@ class FoveatedMnist(nn.Module):
         return loss
 
 
-class Trainer:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
+class FoveatedMnistTrainer(Trainer):
+    def on_validation_end(self):
+        images, labels = next(iter(self.valid_loader))
+        images = images[:3]
+        labels = labels[:3]
 
-        self.rank = int(os.environ.get("RANK", "0"))
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        self.is_main_process = self.rank == 0
-        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        self.device = torch.device("cuda", local_rank)
-        torch.cuda.set_device(self.device)
-        if self.world_size > 1:
-            dist.init_process_group(backend="nccl", device_id=self.device)
-
-        log.info(f"using {DTYPE=}")
-        random.seed(self.rank)
-        np.random.seed(self.rank)
-        torch.manual_seed(self.rank)
-        torch.cuda.manual_seed(self.rank)
-
-        metrics.enabled = self.is_main_process
-        metrics.use_wandb = cfg.use_wandb
-        metrics.context = "train_"
-
-        dataset_path = Path(__file__).parent / "data"
-        dataset_path.mkdir(exist_ok=True)
-
-        self.train_loader = mnist_loader(
-            train=True, batch_size=cfg.batch_size, device=self.device
-        )
-        self.transform = v2.Compose(
-            [
-                v2.RandomCrop(28, padding=2),
-                v2.GaussianBlur(kernel_size=9, sigma=(0.1, 1.0)),
-            ]
-        )
-
-        self.model = FoveatedMnist(cfg.model).to(self.device)
-        if cfg.do_compile:
-            self.model = torch.compile(self.model)
-
-        muon_params, scalar_params, embeds_params, output_params = (
-            auto_split_muon_params(self.model, log_level=logging.INFO)
-        )
-
-        self.optims = []
-        if len(muon_params) > 0:
-            muon = Muon(
-                muon_params,
-                lr=self.cfg.muon_lr,
-                momentum=0.9,
-                weight_decay=self.cfg.wd,
-            )
-            self.optims.append(muon)
-        adamw = torch.optim.AdamW(
-            scalar_params + embeds_params + output_params,
-            lr=self.cfg.adamw_lr,
-            betas=[0.9, 0.99],
-            weight_decay=self.cfg.wd,
-        )
-        self.optims.append(adamw)
-        for opt in self.optims:
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
-
-        self.step = 0
-
-    def log_once(self, s, level=logging.INFO):
-        if self.is_main_process:
-            log.log(level, s)
-
-    def schedule_lr(self):
-        if (
-            self.cfg.lr_cooldown_start is not None
-            and self.step >= self.cfg.lr_cooldown_start
-        ):
-            frac = (self.step - self.cfg.lr_cooldown_start + 1) / (
-                self.cfg.n_steps - self.cfg.lr_cooldown_start
-            )
-            relative_lr = 1.0 - (1 - self.cfg.lr_cooldown_ratio) * min(1.0, frac)
-            for opt in self.optims:
-                for group in opt.param_groups:
-                    group["lr"] = group["initial_lr"] * relative_lr
-        else:
-            relative_lr = 1.0
-        metrics.push(relative_lr=relative_lr)
-
-    def train_step(self):
-        self.schedule_lr()
-
-        images, labels = next(self.train_loader)
-        if self.cfg.do_augment:
-            images = self.transform(images.unsqueeze(-3))
-            images = images.squeeze(-3)
-            assert images.shape == (self.cfg.batch_size, 28, 28)
-
-        loss = self.model(images, labels)
-        loss.backward()
-        for optim in self.optims:
-            optim.step()
-        for optim in self.optims:
-            optim.zero_grad(set_to_none=True)
-
-    @torch.no_grad()
-    def valid_epoch(self):
-        self.model.eval()
-        metrics.context = "valid_"
-
-        # Gather validation metrics: loss, accuracy, etc.
-        for images, labels in mnist_loader(
-            train=False, batch_size=self.cfg.batch_size, epochs=1, device=self.device
-        ):
-            self.model(images, labels)
-
-        # Save video examples
-        images, labels = next(
-            iter(mnist_loader(train=False, batch_size=3, epochs=1, device=self.device))
-        )
         class_logits, _, patch_idx = self.model.generate(images)
         probs = F.softmax(class_logits, dim=-1)
         for i in range(3):
@@ -569,35 +465,33 @@ class Trainer:
                 fps=5,
             )
 
-        metrics.report()
-        self.model.train()
-        metrics.context = "train_"
-
-    def run(self):
-        with tqdm.tqdm(total=self.cfg.n_steps, desc="training") as progress_bar:
-            if self.step == 0:
-                self.log_once("running initial validation epoch")
-                self.valid_epoch()
-            else:
-                progress_bar.update(self.step)
-            while self.step < self.cfg.n_steps:
-                self.train_step()
-
-                if (
-                    self.cfg.valid_every is not None
-                    and (self.step + 1) % self.cfg.valid_every == 0
-                ) or self.step + 1 == self.cfg.n_steps:
-                    self.valid_epoch()
-
-                self.step += 1
-                progress_bar.update(1)
+    def on_epoch_end(self):
+        pass
 
 
 @parse_config
 def main(cfg: Config):
     logging.basicConfig(level=logging.INFO)
+
+    model = FoveatedMnist(cfg.model)
+
+    mnist_train = MNIST(Path(__file__).parent / "data", train=True, download=True)
+    mnist_valid = MNIST(Path(__file__).parent / "data", train=False, download=True)
+
+    # For MNIST, transfer entire dataset to GPU beforehand for speed.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device("cuda", local_rank)
+    train_dataset = TensorDataset(
+        mnist_train.data.to(device), mnist_train.targets.to(device)
+    )
+    valid_dataset = TensorDataset(
+        mnist_valid.data.to(device), mnist_valid.targets.to(device)
+    )
+
     try:
-        trainer = Trainer(cfg)
+        trainer = FoveatedMnistTrainer(
+            cfg.trainer, model, train_dataset, valid_dataset, metrics
+        )
         trainer.run()
     finally:
         if dist.is_initialized():

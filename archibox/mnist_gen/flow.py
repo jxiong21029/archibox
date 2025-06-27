@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torchvision.transforms.v2 as T
 import tqdm
 from bnnp import Metrics, parse_config
 from bnnp.nn import FusedLinear, Output, RMSNorm
@@ -52,8 +51,6 @@ SAVEDIR = Path(__file__).parent / "data/flow"
 
 
 class Config(BaseModel):
-    use_wandb: bool = False
-
     net: MLPConfig = Field(default_factory=MLPConfig)
     flow: FlowConfig = Field(default_factory=FlowConfig)
     trainer: TrainerConfig = Field(
@@ -306,15 +303,8 @@ def main(cfg: Config):
 
     model = MnistFlow(cfg)
 
-    mnist_train = MNIST(
-        Path(__file__).parent / "data", train=True, download=True, transform=T.ToImage()
-    )
-    mnist_valid = MNIST(
-        Path(__file__).parent / "data",
-        train=True,
-        download=True,
-        transform=T.ToImage(),
-    )
+    mnist_train = MNIST(Path(__file__).parent / "data", train=True, download=True)
+    mnist_valid = MNIST(Path(__file__).parent / "data", train=False, download=True)
 
     # For MNIST, transfer entire dataset to GPU beforehand for speed.
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
