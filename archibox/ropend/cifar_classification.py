@@ -1,7 +1,6 @@
 import logging
 import math
 from pathlib import Path
-from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -11,9 +10,20 @@ import wandb
 from bnnp import Metrics, Muon, auto_split_muon_params, parse_config
 from bnnp.nn import FusedLinear, MLPBlock, Output, RMSNorm
 from einops import rearrange
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import v2
+
+from archibox.ropend.positional_embeddings import (
+    AbsolutePE,
+    AbsolutePEConfig,
+    AxialRoPE,
+    AxialRoPEConfig,
+    FixedSinCosPE,
+    FixedSinCosPEConfig,
+    UniformRoPE,
+    UniformRoPEConfig,
+)
 
 log = logging.getLogger(__name__)
 metrics = Metrics(enabled=True, use_wandb=False, use_cuda_events=True)
@@ -32,12 +42,18 @@ class Config(BaseModel):
     mlp_dim: int = 768
     head_dim: int = 64
     depth: int = 6
-    pos_emb: Literal["absolute", "fixed", "rotary"] = "rotary"
-    ape_init_std: float = 0.05
-    rotary_min_freq: float = 1.0
-    rotary_max_freq: float = 100.0
-    rotary_direction_spacing: float = math.pi * (1 - math.sqrt(5))
-    rotary_pool: bool = False
+    pos_embedding: (
+        AbsolutePEConfig | AxialRoPEConfig | FixedSinCosPEConfig | UniformRoPEConfig
+    ) = Field(
+        default_factory=lambda: UniformRoPEConfig(
+            head_dim=64,
+            min_freq=1.0,
+            max_freq=100.0,
+            direction_spacing=math.pi * (1 - math.sqrt(5)),
+        ),
+        discriminator="variant",
+    )
+    # rotary_pool: bool = False
 
     n_steps: int = 10_000
     valid_every: int = 500
@@ -61,45 +77,45 @@ class Config(BaseModel):
     debug: bool = False
 
 
-class Rotary2d(nn.Module):
-    def __init__(
-        self,
-        input_size: tuple[int, int],
-        head_dim: int,
-        min_freq: int,
-        max_freq: int,
-        direction_spacing: float = math.pi * (1 - math.sqrt(5)),
-    ):
-        super().__init__()
-        self.input_size = input_size
-        self.head_dim = head_dim
-        self.min_freq = min_freq
-        self.max_freq = max_freq
-        self.direction_spacing = direction_spacing
+# class Rotary2d(nn.Module):
+#     def __init__(
+#         self,
+#         input_size: tuple[int, int],
+#         head_dim: int,
+#         min_freq: int,
+#         max_freq: int,
+#         direction_spacing: float = math.pi * (1 - math.sqrt(5)),
+#     ):
+#         super().__init__()
+#         self.input_size = input_size
+#         self.head_dim = head_dim
+#         self.min_freq = min_freq
+#         self.max_freq = max_freq
+#         self.direction_spacing = direction_spacing
 
-        n_freqs = head_dim // 2
-        freqs_F = min_freq * (max_freq / min_freq) ** torch.linspace(0, 1, n_freqs)
-        phi_F = torch.arange(n_freqs) * direction_spacing
-        u_F2 = torch.stack((torch.cos(phi_F), torch.sin(phi_F)), dim=-1)
+#         n_freqs = head_dim // 2
+#         freqs_F = min_freq * (max_freq / min_freq) ** torch.linspace(0, 1, n_freqs)
+#         phi_F = torch.arange(n_freqs) * direction_spacing
+#         u_F2 = torch.stack((torch.cos(phi_F), torch.sin(phi_F)), dim=-1)
 
-        H, W = input_size
-        y = torch.linspace(-1, 1, H).reshape(H, 1).expand(H, W)
-        x = torch.linspace(-1, 1, W).reshape(1, W).expand(H, W)
-        positions_HW12 = torch.stack((y, x), dim=-1).reshape(H, W, 1, 2)
-        theta_HWF = (u_F2 * freqs_F.reshape(n_freqs, 1) * positions_HW12).mean(dim=-1)
-        self.register_buffer("cos_HW1F", torch.cos(theta_HWF).reshape(H, W, 1, n_freqs))
-        self.register_buffer("sin_HW1F", torch.sin(theta_HWF).reshape(H, W, 1, n_freqs))
+#         H, W = input_size
+#         y = torch.linspace(-1, 1, H).reshape(H, 1).expand(H, W)
+#         x = torch.linspace(-1, 1, W).reshape(1, W).expand(H, W)
+#         positions_HW12 = torch.stack((y, x), dim=-1).reshape(H, W, 1, 2)
+#         theta_HWF = (u_F2 * freqs_F.reshape(n_freqs, 1) * positions_HW12).mean(dim=-1)
+#         self.register_buffer("cos_HW1F", torch.cos(theta_HWF).reshape(H, W, 1, n_freqs))
+#         self.register_buffer("sin_HW1F", torch.sin(theta_HWF).reshape(H, W, 1, n_freqs))
 
-    def forward(self, input_NHWhd: torch.Tensor) -> torch.Tensor:
-        x_NHWhF, y_NHWhF = input_NHWhd.float().chunk(2, dim=-1)
-        x_out_NHWhF = x_NHWhF * self.cos_HW1F - y_NHWhF * self.sin_HW1F
-        y_out_NHWhF = x_NHWhF * self.sin_HW1F + y_NHWhF * self.cos_HW1F
-        output_NHWhd = torch.cat((x_out_NHWhF, y_out_NHWhF), dim=-1)
-        return output_NHWhd.type_as(input_NHWhd)
+#     def forward(self, input_NHWhd: torch.Tensor) -> torch.Tensor:
+#         x_NHWhF, y_NHWhF = input_NHWhd.float().chunk(2, dim=-1)
+#         x_out_NHWhF = x_NHWhF * self.cos_HW1F - y_NHWhF * self.sin_HW1F
+#         y_out_NHWhF = x_NHWhF * self.sin_HW1F + y_NHWhF * self.cos_HW1F
+#         output_NHWhd = torch.cat((x_out_NHWhF, y_out_NHWhF), dim=-1)
+#         return output_NHWhd.type_as(input_NHWhd)
 
 
 class EncoderSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, rotary: Rotary2d | None):
+    def __init__(self, dim: int, head_dim: int, rotary: AxialRoPE | UniformRoPE | None):
         super().__init__()
         assert dim % head_dim == 0
         self.head_dim = head_dim
@@ -141,10 +157,11 @@ class ViTClassifier(nn.Module):
         head_dim: int,
         depth: int,
         n_classes: int,
-        pos_emb: str,
-        rotary: Rotary2d | None = None,
-        ape_init_std: float = 0.05,
-        rotary_pool: bool = False,
+        pos_emb: AbsolutePEConfig
+        | AxialRoPEConfig
+        | FixedSinCosPEConfig
+        | UniformRoPEConfig,
+        # rotary_pool: bool = False,
     ):
         super().__init__()
         assert image_size[0] % patch_size == 0
@@ -153,29 +170,34 @@ class ViTClassifier(nn.Module):
         nw = image_size[1] // patch_size
         self.patch_size = patch_size
         self.patchify = FusedLinear(patch_size * patch_size * 3, dim)
-        if pos_emb == "rotary":
-            self.pos_embed = None
-        elif pos_emb == "fixed":
-            yy = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
-            xx = torch.linspace(-1, 1, nw).reshape(1, nw).expand(nh, nw)
-            self.pos_embed = nn.Parameter()
-        else:
-            assert pos_emb == "absolute"
-            self.pos_embed = nn.Parameter(torch.randn(nh, nw, dim) * ape_init_std)
-            self.pos_embed._is_embed = True
 
-        if rotary_pool:
-            self.pool_rope = Rotary2d(
-                (nh, nw),
-                dim,
-                min_freq=1.0,
-                max_freq=100.0,
-                direction_spacing=math.pi * (math.sqrt(5) - 1),
-            )
+        if isinstance(pos_emb, AbsolutePEConfig):
+            self.pos_emb = AbsolutePE(pos_emb, nh, nw)
+            self.input_pe = True
+        elif isinstance(pos_emb, AxialRoPEConfig):
+            self.pos_emb = AxialRoPE(pos_emb, nh, nw)
+            self.input_pe = False
+        elif isinstance(pos_emb, FixedSinCosPEConfig):
+            self.pos_emb = FixedSinCosPE(pos_emb, nh, nw)
+            self.input_pe = True
         else:
-            self.pool_rope = None
+            assert isinstance(pos_emb, UniformRoPEConfig)
+            self.pos_emb = UniformRoPEConfig(pos_emb, nh, nw)
+            self.input_pe = False
+
+        # if rotary_pool:
+        #     self.pool_rotation = Rotary2d(
+        #         (nh, nw),
+        #         dim,
+        #         min_freq=1.0,
+        #         max_freq=100.0,
+        #         direction_spacing=math.pi * (math.sqrt(5) - 1),
+        #     )
+        # else:
+        #     self.pool_rotation = None
 
         blocks = []
+        rotary = None if self.input_pe else self.pos_emb
         for _ in range(depth):
             blocks.append(EncoderSelfAttention(dim, head_dim, rotary))
             blocks.append(MLPBlock(dim, mlp_dim))
@@ -193,14 +215,18 @@ class ViTClassifier(nn.Module):
             C=3,
         )
         input_NHWD = self.patchify(input_NHWD)
-        if self.pos_embed is not None:
-            input_NHWD = input_NHWD + self.pos_embed.type_as(input_NHWD)
+        if self.input_pe:
+            input_NHWD = self.pos_emb(input_NHWD)
 
         x_NHWD = self.blocks(input_NHWD)
         if self.pool_rope is None:
             x_ND = x_NHWD.mean(dim=(1, 2))
         else:
-            x_ND = self.pool_rope(x_NHWD.unsqueeze(-2)).squeeze(dim=-2).mean(dim=(1, 2))
+            x_ND = (
+                self.pool_rotation(x_NHWD.unsqueeze(-2))
+                .squeeze(dim=-2)
+                .mean(dim=(1, 2))
+            )
         return self.output(x_ND)
 
 
@@ -265,18 +291,8 @@ def main(cfg: Config):
         head_dim=cfg.head_dim,
         depth=cfg.depth,
         n_classes=10,
-        pos_emb=cfg.pos_emb,
-        rotary=Rotary2d(
-            input_size=(32 // cfg.patch_size, 32 // cfg.patch_size),
-            head_dim=cfg.head_dim,
-            min_freq=cfg.rotary_min_freq,
-            max_freq=cfg.rotary_max_freq,
-            direction_spacing=cfg.rotary_direction_spacing,
-        )
-        if cfg.pos_emb == "rotary"
-        else None,
-        ape_init_std=cfg.ape_init_std,
-        rotary_pool=cfg.rotary_pool,
+        pos_emb=cfg.pos_embedding,
+        # rotary_pool=cfg.rotary_pool,
     )
     raw_model.cuda()
     model = torch.compile(raw_model, mode=COMPILE_MODE) if cfg.do_compile else raw_model
