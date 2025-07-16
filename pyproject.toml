@@ -7,13 +7,13 @@ name = "archibox"
 version = "0.1"
 dependencies = [
     "einops",
-    "gymnasium",
+    "ffcv",
     "huggingface-hub",
     "matplotlib",
     "numpy",
-    "omegaconf",
     "opencv-python",
     "pandas",
+    "pydantic",
     "pytest",
     "scipy",
     "seaborn",
