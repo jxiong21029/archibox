@@ -1,6 +1,7 @@
 import logging
 import math
 from pathlib import Path
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -10,7 +11,7 @@ import wandb
 from bnnp import Metrics, Muon, auto_split_muon_params, parse_config
 from bnnp.nn import FusedLinear, MLPBlock, Output, RMSNorm
 from einops import rearrange
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import v2
 
@@ -42,17 +43,24 @@ class Config(BaseModel):
     mlp_dim: int = 768
     head_dim: int = 64
     depth: int = 6
-    pos_embedding: (
-        AbsolutePEConfig | AxialRoPEConfig | FixedSinCosPEConfig | UniformRoPEConfig
-    ) = Field(
-        default_factory=lambda: UniformRoPEConfig(
-            head_dim=64,
-            min_freq=1.0,
-            max_freq=100.0,
-            direction_spacing=math.pi * (1 - math.sqrt(5)),
-        ),
-        discriminator="variant",
-    )
+    pos_emb: Literal[
+        "absolute", "fixed", "axial_rotary", "gaussian_rotary", "uniform_rotary"
+    ] = "uniform_rotary"
+    ape_init_std: float = 0.05
+    min_freq: float = 1.0
+    max_freq: float = 100.0
+    direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
+    # pos_embedding: (
+    #     AbsolutePEConfig | AxialRoPEConfig | FixedSinCosPEConfig | UniformRoPEConfig
+    # ) = Field(
+    #     default_factory=lambda: UniformRoPEConfig(
+    #         head_dim=64,
+    #         min_freq=1.0,
+    #         max_freq=100.0,
+    #         direction_spacing=math.pi * (1 - math.sqrt(5)),
+    #     ),
+    #     discriminator="variant",
+    # )
     # rotary_pool: bool = False
 
     n_steps: int = 10_000
@@ -75,43 +83,6 @@ class Config(BaseModel):
 
     do_compile: bool = True
     debug: bool = False
-
-
-# class Rotary2d(nn.Module):
-#     def __init__(
-#         self,
-#         input_size: tuple[int, int],
-#         head_dim: int,
-#         min_freq: int,
-#         max_freq: int,
-#         direction_spacing: float = math.pi * (1 - math.sqrt(5)),
-#     ):
-#         super().__init__()
-#         self.input_size = input_size
-#         self.head_dim = head_dim
-#         self.min_freq = min_freq
-#         self.max_freq = max_freq
-#         self.direction_spacing = direction_spacing
-
-#         n_freqs = head_dim // 2
-#         freqs_F = min_freq * (max_freq / min_freq) ** torch.linspace(0, 1, n_freqs)
-#         phi_F = torch.arange(n_freqs) * direction_spacing
-#         u_F2 = torch.stack((torch.cos(phi_F), torch.sin(phi_F)), dim=-1)
-
-#         H, W = input_size
-#         y = torch.linspace(-1, 1, H).reshape(H, 1).expand(H, W)
-#         x = torch.linspace(-1, 1, W).reshape(1, W).expand(H, W)
-#         positions_HW12 = torch.stack((y, x), dim=-1).reshape(H, W, 1, 2)
-#         theta_HWF = (u_F2 * freqs_F.reshape(n_freqs, 1) * positions_HW12).mean(dim=-1)
-#         self.register_buffer("cos_HW1F", torch.cos(theta_HWF).reshape(H, W, 1, n_freqs))
-#         self.register_buffer("sin_HW1F", torch.sin(theta_HWF).reshape(H, W, 1, n_freqs))
-
-#     def forward(self, input_NHWhd: torch.Tensor) -> torch.Tensor:
-#         x_NHWhF, y_NHWhF = input_NHWhd.float().chunk(2, dim=-1)
-#         x_out_NHWhF = x_NHWhF * self.cos_HW1F - y_NHWhF * self.sin_HW1F
-#         y_out_NHWhF = x_NHWhF * self.sin_HW1F + y_NHWhF * self.cos_HW1F
-#         output_NHWhd = torch.cat((x_out_NHWhF, y_out_NHWhF), dim=-1)
-#         return output_NHWhd.type_as(input_NHWhd)
 
 
 class EncoderSelfAttention(nn.Module):
@@ -157,33 +128,14 @@ class ViTClassifier(nn.Module):
         head_dim: int,
         depth: int,
         n_classes: int,
-        pos_emb: AbsolutePEConfig
-        | AxialRoPEConfig
-        | FixedSinCosPEConfig
-        | UniformRoPEConfig,
+        pos_emb: AbsolutePE | AxialRoPE | FixedSinCosPE | UniformRoPE,
         # rotary_pool: bool = False,
     ):
         super().__init__()
         assert image_size[0] % patch_size == 0
         assert image_size[1] % patch_size == 0
-        nh = image_size[0] // patch_size
-        nw = image_size[1] // patch_size
         self.patch_size = patch_size
         self.patchify = FusedLinear(patch_size * patch_size * 3, dim)
-
-        if isinstance(pos_emb, AbsolutePEConfig):
-            self.pos_emb = AbsolutePE(pos_emb, nh, nw)
-            self.input_pe = True
-        elif isinstance(pos_emb, AxialRoPEConfig):
-            self.pos_emb = AxialRoPE(pos_emb, nh, nw)
-            self.input_pe = False
-        elif isinstance(pos_emb, FixedSinCosPEConfig):
-            self.pos_emb = FixedSinCosPE(pos_emb, nh, nw)
-            self.input_pe = True
-        else:
-            assert isinstance(pos_emb, UniformRoPEConfig)
-            self.pos_emb = UniformRoPEConfig(pos_emb, nh, nw)
-            self.input_pe = False
 
         # if rotary_pool:
         #     self.pool_rotation = Rotary2d(
@@ -196,8 +148,11 @@ class ViTClassifier(nn.Module):
         # else:
         #     self.pool_rotation = None
 
+        self.pos_emb = pos_emb
+        self.pos_embed_input = isinstance(self.pos_emb, (AbsolutePE, FixedSinCosPE))
+
         blocks = []
-        rotary = None if self.input_pe else self.pos_emb
+        rotary = None if self.pos_embed_input else self.pos_emb
         for _ in range(depth):
             blocks.append(EncoderSelfAttention(dim, head_dim, rotary))
             blocks.append(MLPBlock(dim, mlp_dim))
@@ -215,18 +170,19 @@ class ViTClassifier(nn.Module):
             C=3,
         )
         input_NHWD = self.patchify(input_NHWD)
-        if self.input_pe:
+        if self.pos_embed_input:
             input_NHWD = self.pos_emb(input_NHWD)
 
         x_NHWD = self.blocks(input_NHWD)
-        if self.pool_rope is None:
-            x_ND = x_NHWD.mean(dim=(1, 2))
-        else:
-            x_ND = (
-                self.pool_rotation(x_NHWD.unsqueeze(-2))
-                .squeeze(dim=-2)
-                .mean(dim=(1, 2))
-            )
+        x_ND = x_NHWD.mean(dim=(1, 2))
+        # if self.pool_rope is None:
+        #     x_ND = x_NHWD.mean(dim=(1, 2))
+        # else:
+        #     x_ND = (
+        #         self.pool_rotation(x_NHWD.unsqueeze(-2))
+        #         .squeeze(dim=-2)
+        #         .mean(dim=(1, 2))
+        #     )
         return self.output(x_ND)
 
 
@@ -236,15 +192,14 @@ def cifar_loader(
     rank: int = 0,
     world_size: int = 1,
     device="cuda" if torch.cuda.is_available() else "cpu",
+    augmentation: v2.Transform | None = None,
+    normalization: v2.Transform | None = None,
     limit_epochs: int | None = None,
 ):
     dataset = CIFAR10("archibox/cifar/data/", train=train)
     images_NHWC = dataset.data
     labels_N = torch.tensor(dataset.targets, device=device)
 
-    # mean = torch.tensor((0.4914, 0.4822, 0.4465), device=device)
-    # std = torch.tensor((0.247, 0.243, 0.261), device=device)
-    # images_NHWC = (images_NHWC - mean) / std
     images_NHWC = torch.tensor(images_NHWC, device=device, dtype=torch.uint8)
     images_NCHW = images_NHWC.movedim(3, 1)
 
@@ -256,8 +211,25 @@ def cifar_loader(
         idx = torch.randperm(len(images_NCHW), generator=rng, device=device)
         idx = idx[rank * batch_size * n_batches : (rank + 1) * batch_size * n_batches]
 
-        shuffled_images_NCHW = images_NCHW[idx].contiguous()
-        shuffled_labels_N = labels_N[idx].contiguous()
+        shuffled_images_NCHW = images_NCHW[idx].clone()
+        shuffled_labels_N = labels_N[idx].clone()
+
+        if augmentation is not None:
+            # pre-augment in batches
+            for i in range(0, len(shuffled_images_NCHW), 1000):
+                shuffled_images_NCHW[i : i + 1000] = augmentation(
+                    shuffled_images_NCHW[i : i + 1000]
+                )
+
+            # shuffle again
+            idx = torch.randperm(
+                len(shuffled_images_NCHW), generator=rng, device=device
+            )
+            shuffled_images_NCHW = shuffled_images_NCHW[idx].contiguous()
+            shuffled_labels_N = shuffled_labels_N[idx].contiguous()
+
+        if normalization is not None:
+            shuffled_images_NCHW = normalization(shuffled_images_NCHW)
 
         for i in range(n_batches):
             yield (
@@ -283,6 +255,41 @@ def main(cfg: Config):
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
 
+    nh, nw = 32 // cfg.patch_size, 32 // cfg.patch_size
+    if cfg.pos_emb == "absolute":
+        pos_emb = AbsolutePE(
+            AbsolutePEConfig(dim=cfg.dim, init_std=cfg.ape_init_std), nh, nw
+        )
+    elif cfg.pos_emb == "fixed":
+        pos_emb = FixedSinCosPE(
+            FixedSinCosPEConfig(
+                dim=cfg.dim, min_freq=cfg.min_freq, max_freq=cfg.max_freq
+            ),
+            nh,
+            nw,
+        )
+    elif cfg.pos_emb == "axial_rotary":
+        pos_emb = AxialRoPE(
+            AxialRoPEConfig(
+                head_dim=cfg.head_dim, min_freq=cfg.min_freq, max_freq=cfg.max_freq
+            ),
+            nh,
+            nw,
+        )
+    else:
+        assert cfg.pos_emb in ("gaussian_rotary", "uniform_rotary")
+        pos_emb = UniformRoPE(
+            UniformRoPEConfig(
+                head_dim=cfg.head_dim,
+                min_freq=cfg.min_freq,
+                max_freq=cfg.max_freq,
+                direction_spacing=cfg.direction_spacing
+                if cfg.pos_emb == "uniform_rotary"
+                else None,
+            ),
+            nh,
+            nw,
+        )
     raw_model = ViTClassifier(
         image_size=(32, 32),
         patch_size=cfg.patch_size,
@@ -291,7 +298,7 @@ def main(cfg: Config):
         head_dim=cfg.head_dim,
         depth=cfg.depth,
         n_classes=10,
-        pos_emb=cfg.pos_embedding,
+        pos_emb=pos_emb,
         # rotary_pool=cfg.rotary_pool,
     )
     raw_model.cuda()
@@ -314,11 +321,8 @@ def main(cfg: Config):
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
 
-    train_loader = iter(
-        cifar_loader(train=True, batch_size=cfg.batch_size, device="cuda")
-    )
     if cfg.do_augment:
-        augment = v2.Compose(
+        augmentation = v2.Compose(
             [
                 v2.ColorJitter(
                     brightness=0.1, contrast=0.1, saturation=0.05, hue=0.025
@@ -327,11 +331,20 @@ def main(cfg: Config):
                 v2.RandomHorizontalFlip(),
             ]
         )
-    normalize = v2.Compose(
+    normalization = v2.Compose(
         [
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
         ]
+    )
+    train_loader = iter(
+        cifar_loader(
+            train=True,
+            batch_size=cfg.batch_size,
+            device="cuda",
+            augmentation=augmentation if cfg.do_augment else None,
+            normalization=normalization,
+        )
     )
 
     metrics.context = "train_"
@@ -354,12 +367,9 @@ def main(cfg: Config):
 
         metrics.tick("load_batch")
         images_NCHW, labels_N = next(train_loader)
-        if cfg.do_augment:
-            images_NCHW = augment(images_NCHW)
-        images_NCHW = normalize(images_NCHW).type(DTYPE)
 
         metrics.tick("forward")
-        logits_ND = model(images_NCHW)
+        logits_ND = model(images_NCHW.type(DTYPE))
         assert logits_ND.dtype == DTYPE
         loss = F.cross_entropy(
             logits_ND.float(), labels_N, label_smoothing=cfg.label_smoothing
@@ -386,10 +396,11 @@ def main(cfg: Config):
                     train=False,
                     batch_size=cfg.batch_size,
                     limit_epochs=1,
+                    augmentation=None,
+                    normalization=normalization,
                     device="cuda",
                 ):
-                    images_NCHW = normalize(images_NCHW).type(DTYPE)
-                    logits_ND = model(images_NCHW)
+                    logits_ND = model(images_NCHW.type(DTYPE))
                     loss = F.cross_entropy(
                         logits_ND.float(), labels_N, label_smoothing=cfg.label_smoothing
                     )
