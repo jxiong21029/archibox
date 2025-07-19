@@ -37,7 +37,7 @@ from archibox.ropend.positional_embeddings import (
 )
 
 log = logging.getLogger(__name__)
-metrics = Metrics(enabled=True, use_wandb=False, use_cuda_events=True)
+metrics = Metrics(enabled=False, use_wandb=False, use_cuda_events=True)
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
     DTYPE = torch.bfloat16
 else:
@@ -65,8 +65,9 @@ class Config(BaseModel):
     pooling: Literal["mean", "rotary", "attention"] = "mean"
 
     n_steps: int = (1_281_167 // 1024) * 150  # == 187_650
-    valid_every: int = 1_281_167 // 1024
     micro_batch_size: int = 256
+    valid_every: int = 1_281_167 // 1024
+    initial_valid: bool = True
     muon_lr: float = 0.03
     muon_mu: float = 0.95
     muon_wd: float = 0.01
@@ -137,6 +138,7 @@ class ViTClassifier(nn.Module):
         super().__init__()
         assert image_size[0] % patch_size == 0
         assert image_size[1] % patch_size == 0
+        self.image_size = image_size
         self.patch_size = patch_size
         self.dim = dim
         self.mlp_dim = mlp_dim
@@ -185,6 +187,8 @@ class ViTClassifier(nn.Module):
         input_NHWD = rearrange(
             images_NCHW,
             "N C (nh ph) (nw pw) -> N nh nw (ph pw C)",
+            nh=self.image_size[0] // self.patch_size,
+            nw=self.image_size[1] // self.patch_size,
             ph=self.patch_size,
             pw=self.patch_size,
             C=3,
@@ -242,12 +246,13 @@ class Trainer:
                     f"device_count={torch.cuda.device_count()} != {local_world_size=}"
                 )
 
+        metrics.enabled = self.is_main_process
         if self.is_main_process and not cfg.debug:
             metrics.use_wandb = True
             wandb.init(
                 entity="archibox",
                 project="ropend-imagenet-class",
-                dir=Path(__file__).parent / "runs",
+                dir=Path(__file__).parent / "runs/imagenet_class",
                 config=cfg.model_dump(),
             )
             log.info(("#" * 40) + "\n" + CODE + "\n" + ("#" * 40))
@@ -289,7 +294,7 @@ class Trainer:
                 nw,
             )
         model = ViTClassifier(
-            image_size=(32, 32),
+            image_size=(224, 224),
             patch_size=cfg.patch_size,
             dim=cfg.dim,
             mlp_dim=cfg.mlp_dim,
@@ -354,11 +359,17 @@ class Trainer:
             shard_id=self.rank,
         )
         self.train_loader = DALIClassificationIterator(
-            self.train_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
+            self.train_pipe,
+            reader_name="imagenet_train_reader",
+            last_batch_policy=LastBatchPolicy.DROP,
+            auto_reset=True,
         )
         self.train_loader_iter = iter(self.train_loader)
         self.valid_loader = DALIClassificationIterator(
-            valid_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
+            valid_pipe,
+            reader_name="imagenet_valid_reader",
+            last_batch_policy=LastBatchPolicy.DROP,
+            auto_reset=True,
         )
         if cfg.mixup > 0:
             self.mixup = v2.MixUp(alpha=cfg.mixup, num_classes=1000)
@@ -393,7 +404,11 @@ class Trainer:
         with tqdm.tqdm(
             total=self.cfg.n_steps, desc="training", mininterval=5.0
         ) as progress_bar:
-            if self.step != 0:
+            if self.step == 0:
+                if self.cfg.initial_valid:
+                    self.log_once("running initial validation epoch")
+                    self.valid_epoch()
+            else:
                 progress_bar.update(self.step)
 
             while self.step < self.cfg.n_steps:
@@ -418,6 +433,7 @@ class Trainer:
 
                 self.train_step()
                 self.step += 1
+                progress_bar.update(1)
 
     def train_step(self):
         metrics.tick("load_batch")
@@ -460,14 +476,14 @@ class Trainer:
 
         if (self.step + 1) % self.cfg.valid_every == 0:
             self.valid_epoch()
-            self.model.train()
-            metrics.context = "train_"
 
     def valid_epoch(self):
         self.model.eval()
         metrics.context = "valid_"
         with torch.no_grad():
-            for batch in self.valid_loader:
+            for batch in tqdm.tqdm(
+                self.valid_loader, desc="validation", mininterval=5.0
+            ):
                 images_NCHW = batch[0]["data"]
                 labels_N = batch[0]["label"].squeeze(-1).long()
 
@@ -483,6 +499,9 @@ class Trainer:
 
         metrics.report()
         self.save_checkpoint()
+
+        self.model.train()
+        metrics.context = "train_"
 
     def save_checkpoint(self):
         if self.cfg.debug:

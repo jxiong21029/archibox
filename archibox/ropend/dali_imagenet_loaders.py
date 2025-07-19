@@ -6,9 +6,10 @@ from nvidia.dali.auto_aug import rand_augment
 def imagenet_train_pipeline(num_shards, shard_id, randaug_n: int, randaug_m: int):
     images, labels = dali.fn.readers.file(
         file_root="/srv/datasets/ImageNet/train",
-        random_shuffle=True,
         num_shards=num_shards,
         shard_id=shard_id,
+        shuffle_after_epoch=True,
+        name="imagenet_train_reader",
     )
     images = dali.fn.decoders.image_random_crop(
         images,
@@ -39,7 +40,10 @@ def imagenet_train_pipeline(num_shards, shard_id, randaug_n: int, randaug_m: int
 @dali.pipeline_def(seed=0)
 def imagenet_valid_pipeline(num_shards, shard_id):
     images, labels = dali.fn.readers.file(
-        file_root="/srv/datasets/ImageNet/val", num_shards=num_shards, shard_id=shard_id
+        file_root="/srv/datasets/ImageNet/val",
+        num_shards=num_shards,
+        shard_id=shard_id,
+        name="imagenet_valid_reader",
     )
     images = dali.fn.decoders.image(images, output_type=dali.types.RGB, device="mixed")
     images = dali.fn.resize(images, resize_shorter=256)
@@ -57,6 +61,7 @@ def imagenet_valid_pipeline(num_shards, shard_id):
 def main():
     import torch
     from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
+    from PIL import Image
 
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -86,6 +91,19 @@ def main():
         images, labels = batch[0]["data"], batch[0]["label"].squeeze(-1)
         print(images.device, images.dtype, images.shape)
         print(labels.device, labels.dtype, labels.shape)
+
+        for i, image in enumerate(images[:10]):
+            Image.fromarray(
+                image.movedim(0, 2)
+                .cpu()
+                .mul(torch.tensor([0.229, 0.224, 0.225]))
+                .add(torch.tensor([0.485, 0.456, 0.406]))
+                .clamp(0, 1)
+                .mul(255)
+                .type(torch.uint8)
+                .numpy()
+            ).save(f"data/train_samples2/{i}_label={labels[i].item()}.png")
+
         break
 
     for batch in valid_loader:
