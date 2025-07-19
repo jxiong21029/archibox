@@ -1,3 +1,6 @@
+with open(__file__, "r") as f:
+    CODE = f.read()
+
 import logging
 import math
 import os
@@ -218,11 +221,12 @@ class ViTClassifier(nn.Module):
         return self.output(x_ND)
 
 
-# @parse_config
-# def main(cfg: Config):
 class Trainer:
-    def __init_(self, cfg: Config):
+    def __init__(self, cfg: Config):
         self.cfg = cfg
+
+        torch.manual_seed(cfg.seed)
+        torch.cuda.manual_seed(cfg.seed)
 
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -238,7 +242,7 @@ class Trainer:
                     f"device_count={torch.cuda.device_count()} != {local_world_size=}"
                 )
 
-        if not cfg.debug:
+        if self.is_main_process and not cfg.debug:
             metrics.use_wandb = True
             wandb.init(
                 entity="archibox",
@@ -246,9 +250,8 @@ class Trainer:
                 dir=Path(__file__).parent / "runs",
                 config=cfg.model_dump(),
             )
-
-        torch.manual_seed(cfg.seed)
-        torch.cuda.manual_seed(cfg.seed)
+            log.info(("#" * 40) + "\n" + CODE + "\n" + ("#" * 40))
+            log.info(f"using {DTYPE=}")
 
         nh, nw = 224 // cfg.patch_size, 224 // cfg.patch_size
         if cfg.pos_emb == "absolute":
@@ -292,14 +295,14 @@ class Trainer:
             mlp_dim=cfg.mlp_dim,
             head_dim=cfg.head_dim,
             depth=cfg.depth,
-            n_classes=10,
+            n_classes=1000,
             pos_emb=pos_emb,
             pooling=cfg.pooling,
         ).to(self.device)
         self.raw_model = model
 
         if cfg.do_compile:
-            model = torch.compile(model)
+            model = torch.compile(model, mode=COMPILE_MODE)
         if self.world_size > 1:
             model = DDP(
                 model, device_ids=[self.local_rank], output_device=self.local_rank
@@ -354,10 +357,8 @@ class Trainer:
             self.train_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
         )
         self.train_loader_iter = iter(self.train_loader)
-        self.valid_loader = iter(
-            DALIClassificationIterator(
-                valid_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
-            )
+        self.valid_loader = DALIClassificationIterator(
+            valid_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
         )
         if cfg.mixup > 0:
             self.mixup = v2.MixUp(alpha=cfg.mixup, num_classes=1000)
@@ -389,26 +390,34 @@ class Trainer:
 
     def run(self):
         metrics.context = "train_"
-        for _ in tqdm.trange(self.cfg.n_steps):
-            # Schedule LR.
-            if (
-                self.cfg.lr_cooldown_start is not None
-                and self.cfg.lr_cooldown_start <= self.step
-                and self.cfg.lr_cooldown_start < self.cfg.n_steps
-            ):
-                frac = (self.step - self.cfg.lr_cooldown_start + 1) / (
-                    self.cfg.n_steps - self.cfg.lr_cooldown_start
-                )
-                relative_lr = 1.0 - (1.0 - self.cfg.lr_cooldown_ratio) * min(1.0, frac)
-                for opt in (self.muon, self.adamw):
-                    for group in opt.param_groups:
-                        group["lr"] = group["initial_lr"] * relative_lr
-            else:
-                relative_lr = 1.0
-            metrics.push(relative_lr=relative_lr)
+        with tqdm.tqdm(
+            total=self.cfg.n_steps, desc="training", mininterval=5.0
+        ) as progress_bar:
+            if self.step != 0:
+                progress_bar.update(self.step)
 
-            self.train_step()
-            self.step += 1
+            while self.step < self.cfg.n_steps:
+                # Schedule LR.
+                if (
+                    self.cfg.lr_cooldown_start is not None
+                    and self.cfg.lr_cooldown_start <= self.step
+                    and self.cfg.lr_cooldown_start < self.cfg.n_steps
+                ):
+                    frac = (self.step - self.cfg.lr_cooldown_start + 1) / (
+                        self.cfg.n_steps - self.cfg.lr_cooldown_start
+                    )
+                    relative_lr = 1.0 - (1.0 - self.cfg.lr_cooldown_ratio) * min(
+                        1.0, frac
+                    )
+                    for opt in (self.muon, self.adamw):
+                        for group in opt.param_groups:
+                            group["lr"] = group["initial_lr"] * relative_lr
+                else:
+                    relative_lr = 1.0
+                metrics.push(relative_lr=relative_lr)
+
+                self.train_step()
+                self.step += 1
 
     def train_step(self):
         metrics.tick("load_batch")
@@ -457,15 +466,15 @@ class Trainer:
         self.model.eval()
         metrics.context = "valid_"
         with torch.no_grad():
-            for batch in self.valid_loader():
+            for batch in self.valid_loader:
                 images_NCHW, labels_N = batch[0]["data"], batch[0]["label"].squeeze(-1)
                 logits_ND = self.model(images_NCHW.type(DTYPE))
                 nll = F.cross_entropy(logits_ND.float(), labels_N)
                 acc = (torch.argmax(logits_ND, dim=-1) == labels_N).float().mean()
                 metrics.push(nll=nll, acc=acc)
 
-        if "valid_loss" in metrics.mean:
-            self.last_valid_loss = metrics.mean["valid_loss"].item()
+        if "valid_nll" in metrics.mean:
+            self.last_valid_loss = metrics.mean["valid_nll"].item()
         else:
             log.warning("valid_loss not found in metrics")
 
