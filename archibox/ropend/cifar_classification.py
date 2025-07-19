@@ -43,25 +43,16 @@ class Config(BaseModel):
     mlp_dim: int = 768
     head_dim: int = 64
     depth: int = 6
-    pos_emb: Literal[
-        "absolute", "fixed", "axial_rotary", "gaussian_rotary", "uniform_rotary"
-    ] = "uniform_rotary"
-    ape_init_std: float = 0.05
+    pos_emb: Literal["absolute", "fixed", "axial_rotary", "uniform_rotary"] = (
+        "uniform_rotary"
+    )
+    ape_init_std: float = 0.5
     min_freq: float = 1.0
     max_freq: float = 100.0
     direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
-    # pos_embedding: (
-    #     AbsolutePEConfig | AxialRoPEConfig | FixedSinCosPEConfig | UniformRoPEConfig
-    # ) = Field(
-    #     default_factory=lambda: UniformRoPEConfig(
-    #         head_dim=64,
-    #         min_freq=1.0,
-    #         max_freq=100.0,
-    #         direction_spacing=math.pi * (1 - math.sqrt(5)),
-    #     ),
-    #     discriminator="variant",
-    # )
-    # rotary_pool: bool = False
+    learnable_rope: bool = False
+    sep_rope_heads: bool = True
+    pooling: Literal["mean", "rotary", "attention"] = "mean"
 
     n_steps: int = 10_000
     valid_every: int = 500
@@ -83,6 +74,8 @@ class Config(BaseModel):
 
     do_compile: bool = True
     debug: bool = False
+    seed: int = 0
+    log_param_info: bool = False
 
 
 class EncoderSelfAttention(nn.Module):
@@ -129,24 +122,41 @@ class ViTClassifier(nn.Module):
         depth: int,
         n_classes: int,
         pos_emb: AbsolutePE | AxialRoPE | FixedSinCosPE | UniformRoPE,
-        # rotary_pool: bool = False,
+        pooling: str = "mean",
     ):
         super().__init__()
         assert image_size[0] % patch_size == 0
         assert image_size[1] % patch_size == 0
         self.patch_size = patch_size
+        self.dim = dim
+        self.mlp_dim = mlp_dim
+        self.n_heads = dim // head_dim
+        self.head_dim = head_dim
+        self.depth = depth
+        self.n_classes = n_classes
+        self.pooling = pooling
         self.patchify = FusedLinear(patch_size * patch_size * 3, dim)
 
-        # if rotary_pool:
-        #     self.pool_rotation = Rotary2d(
-        #         (nh, nw),
-        #         dim,
-        #         min_freq=1.0,
-        #         max_freq=100.0,
-        #         direction_spacing=math.pi * (math.sqrt(5) - 1),
-        #     )
-        # else:
-        #     self.pool_rotation = None
+        if pooling == "rotary":
+            self.pool_rope = UniformRoPE(
+                UniformRoPEConfig(
+                    n_heads=1,
+                    head_dim=dim,
+                    min_freq=1.0,
+                    max_freq=100.0,
+                ),
+                nh=image_size[0] // patch_size,
+                nw=image_size[1] // patch_size,
+            )
+        elif pooling == "attention":
+            self.pool_in_norm = RMSNorm(dim)
+            self.pool_q = nn.Parameter(torch.randn(dim // head_dim, head_dim) / 2)
+            self.pool_q._is_embed = True
+            self.pool_weight_kv = nn.Parameter(torch.randn(2, dim, dim) / dim**0.5 / 2)
+            self.pool_qk_norm = RMSNorm(head_dim)
+            self.pool_rope = pos_emb
+        else:
+            assert pooling == "mean"
 
         self.pos_emb = pos_emb
         self.pos_embed_input = isinstance(self.pos_emb, (AbsolutePE, FixedSinCosPE))
@@ -174,15 +184,30 @@ class ViTClassifier(nn.Module):
             input_NHWD = self.pos_emb(input_NHWD)
 
         x_NHWD = self.blocks(input_NHWD)
-        x_ND = x_NHWD.mean(dim=(1, 2))
-        # if self.pool_rope is None:
-        #     x_ND = x_NHWD.mean(dim=(1, 2))
-        # else:
-        #     x_ND = (
-        #         self.pool_rotation(x_NHWD.unsqueeze(-2))
-        #         .squeeze(dim=-2)
-        #         .mean(dim=(1, 2))
-        #     )
+        if self.pooling == "rotary":
+            x_ND = self.pool_rope(x_NHWD.unsqueeze(-2)).squeeze(dim=-2).mean(dim=(1, 2))
+        elif self.pooling == "attention":
+            N, H, W, D = x_NHWD.shape
+            weight_kv = self.pool_weight_kv.flatten(0, 1).type_as(x_NHWD)
+            k_NHWhd, v_NHWhd = (
+                (self.pool_in_norm(x_NHWD) @ weight_kv.t())
+                .reshape(N, H, W, 2 * self.n_heads, self.head_dim)
+                .chunk(2, dim=-2)
+            )
+            q_hd, k_NHWhd = self.pool_qk_norm(self.pool_q), self.pool_qk_norm(k_NHWhd)
+            q_N1hd = q_hd.expand(N, 1, -1, -1).type_as(x_NHWD)
+            if not self.pos_embed_input:
+                k_NHWhd = self.pool_rope(k_NHWhd)
+            x_Nh1d = F.scaled_dot_product_attention(
+                rearrange(q_N1hd, "N 1 h d -> N h 1 d"),
+                rearrange(k_NHWhd, "N H W h d -> N h (H W) d"),
+                rearrange(v_NHWhd, "N H W h d -> N h (H W) d"),
+            )
+            x_ND = rearrange(x_Nh1d, "N h 1 d -> N (h d)")
+        else:
+            assert self.pooling == "mean"
+            x_ND = x_NHWD.mean(dim=(1, 2))
+
         return self.output(x_ND)
 
 
@@ -252,8 +277,8 @@ def main(cfg: Config):
             dir=Path(__file__).parent / "runs",
             config=cfg.model_dump(),
         )
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed(cfg.seed)
 
     nh, nw = 32 // cfg.patch_size, 32 // cfg.patch_size
     if cfg.pos_emb == "absolute":
@@ -277,15 +302,15 @@ def main(cfg: Config):
             nw,
         )
     else:
-        assert cfg.pos_emb in ("gaussian_rotary", "uniform_rotary")
+        assert cfg.pos_emb == "uniform_rotary"
         pos_emb = UniformRoPE(
             UniformRoPEConfig(
+                n_heads=cfg.dim // cfg.head_dim if cfg.sep_rope_heads else 1,
                 head_dim=cfg.head_dim,
                 min_freq=cfg.min_freq,
                 max_freq=cfg.max_freq,
-                direction_spacing=cfg.direction_spacing
-                if cfg.pos_emb == "uniform_rotary"
-                else None,
+                direction_spacing=cfg.direction_spacing,
+                learnable=cfg.learnable_rope,
             ),
             nh,
             nw,
@@ -299,12 +324,12 @@ def main(cfg: Config):
         depth=cfg.depth,
         n_classes=10,
         pos_emb=pos_emb,
-        # rotary_pool=cfg.rotary_pool,
+        pooling=cfg.pooling,
     )
     raw_model.cuda()
     model = torch.compile(raw_model, mode=COMPILE_MODE) if cfg.do_compile else raw_model
     muon_params, scalar_params, embeds_params, output_params = auto_split_muon_params(
-        raw_model, log_level=logging.DEBUG
+        raw_model, log_level=logging.INFO if cfg.log_param_info else logging.DEBUG
     )
     adamw_params = [
         dict(params=scalar_params, lr=cfg.scalar_lr),
@@ -404,8 +429,9 @@ def main(cfg: Config):
                     loss = F.cross_entropy(
                         logits_ND.float(), labels_N, label_smoothing=cfg.label_smoothing
                     )
+                    nll = F.cross_entropy(logits_ND.float(), labels_N)
                     acc = (torch.argmax(logits_ND, dim=-1) == labels_N).float().mean()
-                    metrics.push(loss=loss, acc=acc)
+                    metrics.push(loss=loss, nll=nll, acc=acc)
 
             metrics.report()
 

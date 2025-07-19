@@ -49,7 +49,8 @@ class FixedSinCosPE(nn.Module):
                 torch.sin(y_HW.unsqueeze(-1) * omega_F),
                 torch.cos(x_HW.unsqueeze(-1) * omega_F),
                 torch.sin(x_HW.unsqueeze(-1) * omega_F),
-            ]
+            ],
+            dim=-1,
         )
         self.register_buffer("embed_HWD", emb)
 
@@ -67,62 +68,23 @@ class AxialRoPEConfig(BaseModel):
 
 class AxialRoPE(nn.Module):
     """
-    Nearly equivalent to UniformRoPE with direction_spacing == pi/2, but the exact same
-    set of frequencies are used for x's and y's (whereas uniform RoPE would be off by
-    one).
+    Nearly equivalent to UniformRoPE with direction_spacing == pi/2, but with the exact
+    same set of frequencies are used for x's and y's (whereas uniform RoPE would be off
+    by one).
     """
 
     def __init__(self, cfg: AxialRoPEConfig, nh: int, nw: int):
         super().__init__()
-
         assert cfg.head_dim % 4 == 0
+
+        y_HW = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
+        x_HW = torch.linspace(-1, 1, nw).reshape(1, nw).expand(nh, nw)
         omega = cfg.min_freq * (cfg.max_freq / cfg.min_freq) ** torch.linspace(
             0, 1, cfg.head_dim // 4
         )
-        y_HW = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
-        x_HW = torch.linspace(-1, 1, nw).reshape(1, nw).expand(nh, nw)
-        positions_HW12 = torch.stack((y_HW, x_HW), dim=-1).reshape(nh, nw, 1, 2)
-        theta_HWF = (
-            torch.cat((omega, omega)).reshape(cfg.head_dim // 2, 1) * positions_HW12
-        ).mean(dim=-1)
-        self.register_buffer("cos_HW1F", torch.cos(theta_HWF).unsqueeze(-2))
-        self.register_buffer("sin_HW1F", torch.cos(theta_HWF).unsqueeze(-2))
-
-    def forward(self, input_NHWhd: torch.Tensor) -> torch.Tensor:
-        x_NHWhF, y_NHWhF = input_NHWhd.float().chunk(2, dim=-1)
-        x_out_NHWhF = x_NHWhF * self.cos_HW1F - y_NHWhF * self.sin_HW1F
-        y_out_NHWhF = x_NHWhF * self.sin_HW1F + y_NHWhF * self.cos_HW1F
-        output_NHWhd = torch.cat((x_out_NHWhF, y_out_NHWhF), dim=-1)
-        return output_NHWhd.type_as(input_NHWhd)
-
-
-class UniformRoPEConfig(BaseModel):
-    head_dim: int
-    min_freq: float
-    max_freq: float
-    direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
-
-    variant: Literal["uniform_rotary"] = "uniform_rotary"
-
-
-class UniformRoPE(nn.Module):
-    def __init__(self, cfg: UniformRoPEConfig, nh: int, nw: int):
-        super().__init__()
-
-        n_freqs = cfg.head_dim // 2
-        freqs_F = cfg.min_freq * (cfg.max_freq / cfg.min_freq) ** torch.linspace(
-            0, 1, n_freqs
+        theta_HWF = torch.cat(
+            (y_HW.unsqueeze(-1) * omega, x_HW.unsqueeze(-1) * omega), dim=-1
         )
-        if cfg.direction_spacing is not None:
-            phi_F = torch.arange(n_freqs) * cfg.direction_spacing
-        else:
-            phi_F = torch.rand(n_freqs) * 2 * torch.pi
-        u_F2 = torch.stack((torch.cos(phi_F), torch.sin(phi_F)), dim=-1)
-
-        y = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
-        x = torch.linspace(-1, 1, nw).reshape(1, nw).expand(nh, nw)
-        positions_HW12 = torch.stack((y, x), dim=-1).reshape(nh, nw, 1, 2)
-        theta_HWF = (u_F2 * freqs_F.reshape(n_freqs, 1) * positions_HW12).mean(dim=-1)
         self.register_buffer("cos_HW1F", torch.cos(theta_HWF).unsqueeze(-2))
         self.register_buffer("sin_HW1F", torch.sin(theta_HWF).unsqueeze(-2))
 
@@ -134,13 +96,63 @@ class UniformRoPE(nn.Module):
         return output_NHWhd.type_as(input_NHWhd)
 
 
-class MixedRoPEConfig(BaseModel):
+class UniformRoPEConfig(BaseModel):
+    n_heads: int
     head_dim: int
     min_freq: float
     max_freq: float
-    learnable: bool = True
+    direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
+    learnable: bool = False
+
+    variant: Literal["uniform_rotary"] = "uniform_rotary"
 
 
-class MixedRoPE(nn.Module):
-    def __init__(self, cfg: MixedRoPEConfig):
-        pass
+class UniformRoPE(nn.Module):
+    def __init__(self, cfg: UniformRoPEConfig, nh: int, nw: int):
+        super().__init__()
+        self.cfg = cfg
+
+        n_freqs = cfg.head_dim // 2
+        omega_F = cfg.min_freq * (cfg.max_freq / cfg.min_freq) ** torch.linspace(
+            0, 1, n_freqs
+        )
+        if cfg.direction_spacing is not None:
+            phi_hF = (
+                torch.arange(cfg.n_heads * n_freqs).reshape(cfg.n_heads, n_freqs)
+                * cfg.direction_spacing
+            )
+        else:
+            phi_hF = torch.rand((cfg.n_heads, n_freqs)) * 2 * torch.pi
+        directions_hF2 = torch.stack((torch.cos(phi_hF), torch.sin(phi_hF)), dim=-1)
+        freqs_hF2 = omega_F.unsqueeze(-1) * directions_hF2
+
+        yy_HW = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
+        xx_HW = torch.linspace(-1, 1, nw).reshape(1, nw).expand(nh, nw)
+        positions_HW112 = torch.stack((yy_HW, xx_HW), dim=-1).reshape(nh, nw, 1, 1, 2)
+
+        if cfg.learnable:
+            self.freqs_hF2 = nn.Parameter(freqs_hF2)
+            self.freqs_hF2._is_embed = True
+            self.register_buffer("positions_HW112", positions_HW112)
+        else:
+            theta_HWhF = (freqs_hF2 * positions_HW112).sum(dim=-1)
+            self.register_buffer("cos_HWhF", torch.cos(theta_HWhF))
+            self.register_buffer("sin_HWhF", torch.sin(theta_HWhF))
+
+    def forward(self, input_NHWhd: torch.Tensor) -> torch.Tensor:
+        x_NHWhF, y_NHWhF = input_NHWhd.float().chunk(2, dim=-1)
+
+        if self.cfg.learnable:
+            theta_HWhF = (self.freqs_hF2.float() * self.positions_HW112.float()).sum(
+                dim=-1
+            )
+            cos_HWhF = torch.cos(theta_HWhF)
+            sin_HWhF = torch.sin(theta_HWhF)
+            x_out_NHWhF = x_NHWhF * cos_HWhF - y_NHWhF * sin_HWhF
+            y_out_NHWhF = x_NHWhF * sin_HWhF + y_NHWhF * cos_HWhF
+        else:
+            x_out_NHWhF = x_NHWhF * self.cos_HWhF - y_NHWhF * self.sin_HWhF
+            y_out_NHWhF = x_NHWhF * self.sin_HWhF + y_NHWhF * self.cos_HWhF
+
+        output_NHWhd = torch.cat((x_out_NHWhF, y_out_NHWhF), dim=-1)
+        return output_NHWhd.type_as(input_NHWhd)
