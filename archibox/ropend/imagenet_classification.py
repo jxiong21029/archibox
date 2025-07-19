@@ -178,7 +178,7 @@ class ViTClassifier(nn.Module):
             blocks.append(MLPBlock(dim, mlp_dim))
         self.blocks = nn.Sequential(*blocks)
 
-        self.output = Output(dim, n_classes)
+        self.output = Output(dim, n_classes, pad_to=64)
 
     def forward(self, images_NCHW: torch.Tensor) -> torch.Tensor:
         assert torch.is_floating_point(images_NCHW)
@@ -431,7 +431,8 @@ class Trainer:
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
 
-        images_NCHW, labels_N = batch[0]["data"], batch[0]["label"].squeeze(-1)
+        images_NCHW = batch[0]["data"]
+        labels_N = batch[0]["label"].squeeze(-1).long()
         if self.cfg.mixup > 0:
             images_NCHW, labels_ND = self.mixup(images_NCHW, labels_N)
 
@@ -467,7 +468,9 @@ class Trainer:
         metrics.context = "valid_"
         with torch.no_grad():
             for batch in self.valid_loader:
-                images_NCHW, labels_N = batch[0]["data"], batch[0]["label"].squeeze(-1)
+                images_NCHW = batch[0]["data"]
+                labels_N = batch[0]["label"].squeeze(-1).long()
+
                 logits_ND = self.model(images_NCHW.type(DTYPE))
                 nll = F.cross_entropy(logits_ND.float(), labels_N)
                 acc = (torch.argmax(logits_ND, dim=-1) == labels_N).float().mean()
@@ -482,6 +485,9 @@ class Trainer:
         self.save_checkpoint()
 
     def save_checkpoint(self):
+        if self.cfg.debug:
+            return
+
         main_rng_state = torch.random.get_rng_state()
         cuda_rng_state = torch.cuda.random.get_rng_state(self.device)
         rng_state = torch.cat([main_rng_state, cuda_rng_state]).to(self.device)

@@ -52,3 +52,48 @@ def imagenet_valid_pipeline(num_shards, shard_id):
         std=[0.229 * 255, 0.224 * 255, 0.225 * 255],
     )
     return images, labels.gpu()
+
+
+def main():
+    import torch
+    from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    train_pipe = imagenet_train_pipeline(
+        batch_size=1024,
+        num_threads=4,
+        device_id=0,
+        num_shards=1,
+        shard_id=0,
+        randaug_n=2,
+        randaug_m=10,
+    )
+    train_pipe.build()
+    valid_pipe = imagenet_valid_pipeline(
+        batch_size=1024, num_threads=4, device_id=0, num_shards=1, shard_id=0
+    )
+    valid_pipe.build()
+
+    train_loader = DALIClassificationIterator(
+        train_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
+    )
+    valid_loader = DALIClassificationIterator(
+        valid_pipe, last_batch_policy=LastBatchPolicy.DROP, auto_reset=True
+    )
+    for batch in train_loader:
+        images, labels = batch[0]["data"], batch[0]["label"].squeeze(-1)
+        print(images.device, images.dtype, images.shape)
+        print(labels.device, labels.dtype, labels.shape)
+        break
+
+    for batch in valid_loader:
+        images, labels = batch[0]["data"], batch[0]["label"].squeeze(-1)
+        print(images.device, images.dtype, images.shape)
+        print(labels.device, labels.dtype, labels.shape)
+        break
+
+
+if __name__ == "__main__":
+    main()
