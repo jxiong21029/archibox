@@ -19,23 +19,24 @@ import logging
 import os
 from pathlib import Path
 
-import einops
 import matplotlib
-import matplotlib.pyplot as plt
-import numpy as np
 import seaborn as sns
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from bnnp import Metrics, parse_config
-from bnnp.nn import FusedLinear, Output
-from einops import rearrange
+from bnnp.nn import Output
 from pydantic import BaseModel, Field
 from torch.utils.data import TensorDataset
 from torchvision.datasets import MNIST
 
-from archibox.foveation.multirotary import MultiRotaryDecoder
+from archibox.foveation.patching import (
+    PatchDecoder,
+    build_patch_locs,
+    extract_patches,
+    visualize_patches,
+)
 from archibox.trainer import Trainer, TrainerConfig
 from archibox.utils import save_frames_to_gif, save_frames_to_mp4
 
@@ -85,155 +86,6 @@ class Config(BaseModel):
             adamw_mu2=0.99,
         )
     )
-
-
-class FourierEmbed(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        nfreqs: int,
-        min_freq: float,
-        max_freq: float,
-        frozen: bool = True,
-    ):
-        super().__init__()
-        self.in_dim = in_dim
-
-        z = torch.randn(nfreqs, in_dim)
-        z = z / (z.pow(2).mean(dim=1, keepdim=True) + 1e-7).sqrt()
-        self.z = nn.Parameter(z, requires_grad=not frozen)
-        self.freqs_H = nn.Parameter(
-            min_freq * (max_freq / min_freq) ** torch.linspace(0, 1, nfreqs),
-            requires_grad=not frozen,
-        )
-
-    def forward(self, x_ND):
-        assert x_ND.size(-1) == self.in_dim
-        alignments_NH = (self.z * x_ND.unsqueeze(-2)).mean(dim=-1)
-        theta_NH = self.freqs_H * alignments_NH
-        return torch.cat([torch.sin(theta_NH), torch.cos(theta_NH)], dim=-1)
-
-
-class PatchDecoder(nn.Module):
-    def __init__(
-        self,
-        patch_size: list[int],
-        dim: int,
-        mlp_dim: int,
-        depth: int,
-        nfreqs: int,
-        seq_len: int,
-    ):
-        super().__init__()
-        self.patchify = FusedLinear(np.prod(patch_size), dim)
-
-        # Include both absolute and relative positional embedding
-        self.pos_embed = FourierEmbed(3, nfreqs, min_freq=0.1, max_freq=100.0)
-        self.emb_proj = FusedLinear(nfreqs * 2, dim)
-
-        self.decoder = MultiRotaryDecoder(
-            dim,
-            mlp_dim,
-            head_dim=64,
-            pos_dim=3,
-            depth=depth,
-            seq_len=seq_len,
-            use_rope=True,
-            min_freq=0.1,
-            max_freq=100.0,
-            frozen_rope=True,
-        )
-
-    def forward(self, patches_NTHWC, pos_NT2, sizes_NT):
-        """
-        Args:
-            patches_NTHWC: patches (should be already resized) extracted from images
-            pos_NT2: coordinates of patch centers in [-1, 1].
-                -1 is bottom/left, +1 is top/right
-            sizes_NT: sizes of patches in [0, 1]
-                0 is size 0, 1 is full image
-        """
-        assert torch.is_floating_point(patches_NTHWC)
-        N, T, _, _, _ = patches_NTHWC.shape
-
-        patches_NTD = rearrange(patches_NTHWC, "N T H W C -> N T (H W C)")
-        x_NTD = self.patchify(patches_NTD)
-
-        pos_NT3 = torch.cat([pos_NT2, sizes_NT.unsqueeze(-1)], dim=-1)
-
-        pos_emb = self.pos_embed(pos_NT3).type_as(x_NTD)
-        emb_NTD = self.emb_proj(pos_emb)
-        return self.decoder(x_NTD + emb_NTD, pos_NT3)
-
-
-def build_patch_locs(nlevels: int = 4, overlap: bool = True) -> torch.Tensor:
-    """Returns a tensor of shape (total_patches, 4) containing (y_min, x_min, y_max,
-    x_max) for every patch in every level.
-
-    Coordinates are in [-1, 1].
-    """
-    locs = []
-
-    for level in range(nlevels):
-        n = 2 ** (level + 1) - 1 if overlap else 2**level
-        half_side = 1 / 2**level
-        centers = torch.linspace(-1, 1, n + 2)[1:-1]
-
-        cy, cx = torch.meshgrid(centers, centers, indexing="ij")  # (n, n)
-        new_locs = torch.stack(
-            [cy - half_side, cx - half_side, cy + half_side, cx + half_side], dim=-1
-        )  # (n, n, 4)
-        locs.append(new_locs.reshape(-1, 4))  # flatten to (n^2, 4)
-
-    return torch.cat(locs, dim=0)
-
-
-def extract_patches(
-    images_NCHW: torch.Tensor,
-    y0_NT: torch.Tensor,
-    x0_NT: torch.Tensor,
-    y1_NT: torch.Tensor,
-    x1_NT: torch.Tensor,
-    P: int,
-):
-    """Extracts patches from batch of images using area-style intepolation.
-
-    T: number of patches per image
-    P: resized patch side length, in pixels
-    """
-    assert torch.is_floating_point(images_NCHW)
-    N, C, H, W = images_NCHW.shape
-    _, T = y0_NT.shape
-    assert y0_NT.shape == y1_NT.shape == x0_NT.shape == x1_NT.shape == (N, T)
-
-    offsets = torch.linspace(0, 1, P + 1, device=images_NCHW.device)
-    ys_NTP = y0_NT[..., None] + (y1_NT - y0_NT)[..., None] * offsets
-    xs_NTP = x0_NT[..., None] + (x1_NT - x0_NT)[..., None] * offsets
-    ys_NTPP = ys_NTP.view(N, T, P + 1, 1).expand(N, T, P + 1, P + 1)
-    xs_NTPP = xs_NTP.view(N, T, 1, P + 1).expand(N, T, P + 1, P + 1)
-    grid_xy_NTPP2 = torch.stack([xs_NTPP, ys_NTPP], dim=-1)
-
-    integral = torch.zeros((N, C, H + 1, W + 1), device=images_NCHW.device)
-    integral[:, :, 1:, 1:] = images_NCHW.cumsum(dim=-1).cumsum(dim=-2)
-
-    integral_samples = F.grid_sample(
-        einops.repeat(integral, "N C H W -> (N T) C H W", T=T),
-        grid_xy_NTPP2.reshape(N * T, P + 1, P + 1, 2).float(),
-        mode="bilinear",
-        align_corners=True,
-        padding_mode="border",
-    ).reshape(N, T, C, P + 1, P + 1)
-
-    i00 = integral_samples[..., :-1, :-1]
-    i01 = integral_samples[..., :-1, 1:]
-    i10 = integral_samples[..., 1:, :-1]
-    i11 = integral_samples[..., 1:, 1:]
-
-    # Box-sum via 4-corner trick, then divide by pixel area
-    sums = i11 - i01 - i10 + i00
-    area = (y1_NT - y0_NT) * H / 2 / P * (x1_NT - x0_NT) * W / 2 / P
-    patches = sums / area.view(N, T, 1, 1, 1)
-    return patches.type_as(images_NCHW)
 
 
 def sample_topk(logits: torch.Tensor, k: int):
@@ -286,7 +138,7 @@ class FoveatedMnist(nn.Module):
         sizes_NT = (y1 - y0) / 2
 
         # Compute class logits
-        output_NTD = self.net(patches_NThw.unsqueeze(-1), pos_NT2, sizes_NT)
+        output_NTD = self.net(patches_NThw.unsqueeze(-3), pos_NT2, sizes_NT)
         class_logits = self.output_head(output_NTD).float()
 
         # Compute patch logits
@@ -298,12 +150,12 @@ class FoveatedMnist(nn.Module):
         return class_logits, patch_logits
 
     def generate(self, images_NHW, n_uniform: int = 0):
-        assert images_NHW.dtype == torch.uint8
+        assert torch.is_floating_point(images_NHW)
         N, H, W = images_NHW.shape
         L = len(self.patch_locs)
         T = self.cfg.seq_len
 
-        images_NHW = images_NHW.type(DTYPE) / 255 * 2 - 1
+        images_NHW = images_NHW.type(DTYPE)
         all_class_logits = []
         all_patch_logits = []
         all_patch_idx = []
@@ -395,75 +247,24 @@ class FoveatedMnist(nn.Module):
 
 class FoveatedMnistTrainer(Trainer):
     def on_validation_end(self):
+        self.metrics.tick("visualization")
         images, labels = next(iter(self.valid_loader))
         images = images[:3]
         labels = labels[:3]
-
         class_logits, _, patch_idx = self.model.generate(images)
-        probs = F.softmax(class_logits, dim=-1)
         for i in range(3):
-            img = images[i].cpu()
-
-            frames = []
-            fig, axes = plt.subplots(nrows=2, ncols=2, constrained_layout=True)
-            fig.set_size_inches(10, 10)
-            axes[0, 0].set_title("Full image")
-            axes[0, 0].imshow(img, cmap="gray")
-            axes[0, 0].axis("off")
-
-            axes[0, 1].set_title("Model views")
-            axes[0, 1].set_xlim(-1, 1)
-            axes[0, 1].set_ylim(1, -1)
-            axes[0, 1].axis("off")
-
-            for t in range(self.model.cfg.seq_len):
-                y0, x0, y1, x1 = self.model.patch_locs[patch_idx[i, t]].cpu()
-                P = self.model.cfg.patch_size
-                patch = extract_patches(
-                    img.view(1, 1, 28, 28).float() / 255.0,
-                    y0.view(1, 1),
-                    x0.view(1, 1),
-                    y1.view(1, 1),
-                    x1.view(1, 1),
-                    P,
-                )
-                assert patch.shape == (1, 1, 1, P, P)
-                patch = (patch.view(P, P).clamp(0, 1) * 255.0).type(torch.uint8)
-                patch = patch.numpy()
-                # half_pixel = (y1 - y0) / P / 2
-                axes[0, 1].imshow(
-                    patch, origin="upper", extent=(x0, x1, y1, y0), cmap="gray"
-                )
-
-                axes[1, 0].clear()
-                axes[1, 0].set_title("Class distribution")
-                axes[1, 0].barh(np.arange(10), probs[i, t].cpu().numpy())
-                axes[1, 0].set_xlim(0, 1.05)
-                axes[1, 0].set_ylim(10, -1)
-                axes[1, 0].set_yticks(np.arange(10))
-
-                axes[1, 1].clear()
-                axes[1, 1].set_title(f"P(label == {int(labels[i])})")
-                axes[1, 1].set_xlim(0, self.model.cfg.seq_len)
-                axes[1, 1].set_ylim(-0.05, 1.05)
-                axes[1, 1].plot(probs[i, : t + 1, int(labels[i])].float().cpu().numpy())
-
-                fig.canvas.draw()
-                frames.append(np.asarray(fig.canvas.buffer_rgba()).copy()[..., :3])
-            plt.close(fig)
-
-            save_frames_to_mp4(
-                frames,
-                Path(__file__).parent
-                / f"data/step_{self.step + 1 if self.step > 0 else 0}_sample_{i + 1}.mp4",
-                fps=5,
+            frames = visualize_patches(
+                image_CHW=images[i].unsqueeze(0),
+                label=labels[i].item(),
+                class_logits=class_logits[i],
+                patch_locs=self.model.patch_locs,
+                patch_idx=patch_idx[i],
+                P=self.model.cfg.patch_size,
             )
-            save_frames_to_gif(
-                frames,
-                Path(__file__).parent
-                / f"data/step_{self.step + 1 if self.step > 0 else 0}_sample_{i + 1}.gif",
-                fps=5,
-            )
+            name = f"data/step_{self.step + 1 if self.step > 0 else 0}_sample_{i + 1}"
+            save_frames_to_gif(frames, Path(__file__).parent / f"{name}.gif", fps=5)
+            save_frames_to_mp4(frames, Path(__file__).parent / f"{name}.mp4", fps=5)
+        self.metrics.tick(None)
 
     def on_epoch_end(self):
         pass
@@ -482,10 +283,12 @@ def main(cfg: Config):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device("cuda", local_rank)
     train_dataset = TensorDataset(
-        mnist_train.data.to(device), mnist_train.targets.to(device)
+        mnist_train.data.to(device, DTYPE) / 255.0 * 2 - 1,
+        mnist_train.targets.to(device),
     )
     valid_dataset = TensorDataset(
-        mnist_valid.data.to(device), mnist_valid.targets.to(device)
+        mnist_valid.data.to(device, DTYPE) / 255.0 * 2 - 1,
+        mnist_valid.targets.to(device),
     )
 
     try:
