@@ -7,7 +7,6 @@ name = "archibox"
 version = "0.1"
 dependencies = [
     "einops",
-    "ffcv",
     "huggingface-hub",
     "matplotlib",
     "numpy",
