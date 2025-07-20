@@ -77,6 +77,9 @@ class Trainer:
 
         self.train_dataset = train_dataset
         self.valid_dataset = valid_dataset
+        self.log(
+            f"dataset lengths: train {len(train_dataset):,} || valid {len(valid_dataset)}"
+        )
         self.train_sampler = (
             DistributedSampler(train_dataset, shuffle=True)
             if self.world_size > 1
@@ -224,11 +227,18 @@ class Trainer:
         self.metrics.context = "valid_"
         torch.set_grad_enabled(False)
 
-        for batch in tqdm.tqdm(self.valid_loader, desc="validation", mininterval=5.0):
+        self.metrics.tick("load_batch")
+        for i, batch in enumerate(
+            tqdm.tqdm(self.valid_loader, desc="validation", mininterval=5.0)
+        ):
             batch = tree_map(
                 lambda x: x.to(self.device) if isinstance(x, torch.Tensor) else x, batch
             )
+            self.metrics.tick("forward")
             self.model(batch)
+            if i < len(self.valid_loader) - 1:
+                self.metrics.tick("load_batch")
+        self.metrics.tick(None)
 
         if self.is_main_process and self.cfg.ckpt_best_key is not None:
             if self.cfg.ckpt_best_key not in self.metrics.mean:
@@ -304,7 +314,7 @@ class Trainer:
         ckpt = dict(
             step=self.step,
             epoch=self.epoch,
-            best_valid_loss=self.best_valid_loss,
+            # best_valid_loss=self.best_valid_loss,
             train_loader=self.train_loader.state_dict(),
             model=self.raw_model.state_dict(),
             muon=self.muon.state_dict(),
@@ -323,7 +333,7 @@ class Trainer:
         ckpt = torch.load(filepath)
         self.step = ckpt["step"]
         self.epoch = ckpt["epoch"]
-        self.best_valid_loss = ckpt["best_valid_loss"]
+        # self.best_valid_loss = ckpt["best_valid_loss"]
         self.train_loader.load_state_dict(ckpt["train_loader"])
         self.raw_model.load_state_dict(ckpt["model"])
         self.muon.load_state_dict(ckpt["muon"])

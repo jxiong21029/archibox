@@ -111,11 +111,13 @@ def make_output_head(dim: int, out_dim: int):
 
 
 def pad_to_multiple(n, k=64):
+    if k is None:
+        return n
     return ((n + k - 1) // k) * k
 
 
 class SoftmaxHead(nn.Module):
-    def __init__(self, dim: int, n_classes: int, pad_to: int = 64):
+    def __init__(self, dim: int, n_classes: int, pad_to: int | None = None):
         super().__init__()
         self.n_classes = n_classes
         self.head = make_output_head(dim, pad_to_multiple(n_classes, pad_to))
