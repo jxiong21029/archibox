@@ -85,7 +85,6 @@ class Config(BaseModel):
     do_compile: bool = True
     debug: bool = False
     seed: int = 0
-    log_param_info: bool = False
     resume_from: str | None = None
 
 
