@@ -43,6 +43,7 @@ def imagenet_valid_pipeline(num_shards, shard_id):
         file_root="/srv/datasets/ImageNet/val",
         num_shards=num_shards,
         shard_id=shard_id,
+        stick_to_shard=True,
         name="imagenet_valid_reader",
     )
     images = dali.fn.decoders.image(images, output_type=dali.types.RGB, device="mixed")

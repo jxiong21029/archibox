@@ -238,6 +238,7 @@ class Trainer:
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.device = torch.device("cuda", self.local_rank)
         torch.cuda.set_device(self.device)
+        self.log_once(f"running with world_size={self.world_size}")
         if self.world_size > 1:
             local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
             dist.init_process_group(backend="nccl", device_id=self.device)
@@ -371,6 +372,9 @@ class Trainer:
             last_batch_policy=LastBatchPolicy.DROP,
             auto_reset=True,
         )
+        self.log_once(
+            f"train_loader: len={len(self.train_loader_iter):,}, _size={self.train_loader._size:,}"
+        )
         if cfg.mixup > 0:
             self.mixup = v2.MixUp(alpha=cfg.mixup, num_classes=1000)
 
@@ -449,6 +453,7 @@ class Trainer:
 
         images_NCHW = batch[0]["data"]
         labels_N = batch[0]["label"].squeeze(-1).long()
+        assert images_NCHW.size(0) == labels_N.size(0) == self.cfg.micro_batch_size
         if self.cfg.mixup > 0:
             images_NCHW, labels_ND = self.mixup(images_NCHW, labels_N)
 
@@ -481,6 +486,9 @@ class Trainer:
         self.model.eval()
         metrics.context = "valid_"
         with torch.no_grad():
+            mean_nll = 0
+            mean_acc = 0
+            n = 0
             for batch in tqdm.tqdm(
                 self.valid_loader, desc="validation", mininterval=5.0
             ):
@@ -490,12 +498,21 @@ class Trainer:
                 logits_ND = self.model(images_NCHW.type(DTYPE))
                 nll = F.cross_entropy(logits_ND.float(), labels_N)
                 acc = (torch.argmax(logits_ND, dim=-1) == labels_N).float().mean()
-                metrics.push(nll=nll, acc=acc)
 
-        if "valid_nll" in metrics.mean:
-            self.last_valid_loss = metrics.mean["valid_nll"].item()
-        else:
-            log.warning("valid_loss not found in metrics")
+                n += 1
+                mean_nll = mean_nll + (nll - mean_nll) / n
+                mean_acc = mean_acc + (acc - mean_acc) / n
+            # Reduce validation metrics (not worth speed penalty for train)
+            if self.world_size > 1:
+                dist.all_reduce(mean_nll, op=dist.ReduceOp.AVG)
+                dist.all_reduce(mean_acc, op=dist.ReduceOp.AVG)
+            metrics.push(nll=mean_nll, acc=mean_acc)
+
+        if self.is_main_process:
+            if "valid_nll" in metrics.mean:
+                self.last_valid_loss = metrics.mean["valid_nll"].item()
+            else:
+                log.warning("valid_loss not found in metrics")
 
         metrics.report()
         self.save_checkpoint()
