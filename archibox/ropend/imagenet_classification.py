@@ -40,9 +40,10 @@ log = logging.getLogger(__name__)
 metrics = Metrics(enabled=False, use_wandb=False, use_cuda_events=True)
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
     DTYPE = torch.bfloat16
+    COMPILE_MODE = "max-autotune"
 else:
     DTYPE = torch.float32
-COMPILE_MODE = "default"
+    COMPILE_MODE = "default"
 
 
 class Config(BaseModel):
@@ -54,7 +55,7 @@ class Config(BaseModel):
     head_dim: int = 64
     depth: int = 12
     pos_emb: Literal["absolute", "fixed", "axial_rotary", "uniform_rotary"] = (
-        "uniform_rotary"
+        "axial_rotary"
     )
     ape_init_std: float = 0.5
     min_freq: float = 1.0
@@ -371,8 +372,8 @@ class Trainer:
             last_batch_policy=LastBatchPolicy.DROP,
             auto_reset=True,
         )
-        self.log_once(
-            f"train_loader: len={len(self.train_loader_iter):,}, _size={self.train_loader._size:,}"
+        log.info(
+            f"rank={self.rank}, len(train_loader)={len(self.train_loader_iter):,}, train_loader._size={self.train_loader._size:,}"
         )
         if cfg.mixup > 0:
             self.mixup = v2.MixUp(alpha=cfg.mixup, num_classes=1000)
