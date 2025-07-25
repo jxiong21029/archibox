@@ -22,6 +22,8 @@ from archibox.ropend.positional_embeddings import (
     AxialRoPEConfig,
     FixedSinCosPE,
     FixedSinCosPEConfig,
+    LieRE,
+    LieREConfig,
     UniformRoPE,
     UniformRoPEConfig,
 )
@@ -43,12 +45,13 @@ class Config(BaseModel):
     mlp_dim: int = 768
     head_dim: int = 64
     depth: int = 6
-    pos_emb: Literal["absolute", "fixed", "axial_rotary", "uniform_rotary"] = (
+    pos_emb: Literal["absolute", "fixed", "axial_rotary", "liere", "uniform_rotary"] = (
         "uniform_rotary"
     )
     ape_init_std: float = 0.5
     min_freq: float = 1.0
     max_freq: float = 100.0
+    n_zero_freqs: int = 0
     direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
     learnable_rope: bool = False
     sep_rope_heads: bool = True
@@ -79,7 +82,9 @@ class Config(BaseModel):
 
 
 class EncoderSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, rotary: AxialRoPE | UniformRoPE | None):
+    def __init__(
+        self, dim: int, head_dim: int, rotary: AxialRoPE | LieRE | UniformRoPE | None
+    ):
         super().__init__()
         assert dim % head_dim == 0
         self.head_dim = head_dim
@@ -296,7 +301,19 @@ def main(cfg: Config):
     elif cfg.pos_emb == "axial_rotary":
         pos_emb = AxialRoPE(
             AxialRoPEConfig(
-                head_dim=cfg.head_dim, min_freq=cfg.min_freq, max_freq=cfg.max_freq
+                head_dim=cfg.head_dim,
+                min_freq=cfg.min_freq,
+                max_freq=cfg.max_freq,
+                n_zero_freqs=cfg.n_zero_freqs,
+            ),
+            nh,
+            nw,
+        )
+    elif cfg.pos_emb == "liere":
+        pos_emb = LieRE(
+            LieREConfig(
+                # n_heads=cfg.dim // cfg.head_dim if cfg.sep_rope_heads else 1,
+                head_dim=cfg.head_dim,
             ),
             nh,
             nw,
@@ -309,6 +326,7 @@ def main(cfg: Config):
                 head_dim=cfg.head_dim,
                 min_freq=cfg.min_freq,
                 max_freq=cfg.max_freq,
+                n_zero_freqs=cfg.n_zero_freqs,
                 direction_spacing=cfg.direction_spacing,
                 learnable=cfg.learnable_rope,
             ),

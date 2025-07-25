@@ -55,17 +55,19 @@ class Config(BaseModel):
     head_dim: int = 64
     depth: int = 12
     pos_emb: Literal["absolute", "fixed", "axial_rotary", "uniform_rotary"] = (
-        "axial_rotary"
+        "uniform_rotary"
     )
     ape_init_std: float = 0.5
-    min_freq: float = 1.0
-    max_freq: float = 100.0
+    min_freq: float = 0.2
+    max_freq: float = 20.0
+    n_zero_freqs: int = 0
+    # For Mixed RoPE, set direction_spacing = None, learnable_rope = True
     direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
     learnable_rope: bool = False
     sep_rope_heads: bool = True
     pooling: Literal["mean", "rotary", "attention"] = "mean"
 
-    n_steps: int = (1_281_167 // 1024) * 150  # == 187_650
+    n_steps: int = (1_281_167 // 1024) * 90  # == 187_650
     micro_batch_size: int = 256
     valid_every: int = 1_281_167 // 1024
     initial_valid: bool = True
@@ -77,7 +79,7 @@ class Config(BaseModel):
     output_lr: float = 0.001
     adamw_mus: tuple[float, float] = (0.9, 0.95)
     adamw_wd: float = 0.01
-    lr_cooldown_start: int | None = (1_281_167 // 1024) * 120
+    lr_cooldown_start: int | None = (1_281_167 // 1024) * 70
     lr_cooldown_ratio: float = 0.0
 
     rand_augment: tuple[int, int] = (2, 10)
@@ -102,6 +104,9 @@ class EncoderSelfAttention(nn.Module):
         self.qk_norm = RMSNorm(head_dim)
         self.o_proj = FusedLinear(dim, dim, scale=True, zero_init=True)
 
+        self.scale_temperature = False
+        self.register_buffer("temperature", torch.tensor(1.0), persistent=False)
+
     def forward(self, input_NHWD: torch.Tensor) -> torch.Tensor:
         N, H, W, D = input_NHWD.shape
         qkv_weight = self.qkv_weight.flatten(0, 1).type_as(input_NHWD)
@@ -113,6 +118,9 @@ class EncoderSelfAttention(nn.Module):
         q_NHWhd, k_NHWhd = self.qk_norm(q_NHWhd), self.qk_norm(k_NHWhd)
         if self.rotary is not None:
             q_NHWhd, k_NHWhd = self.rotary(q_NHWhd), self.rotary(k_NHWhd)
+        if self.scale_temperature:
+            q_NHWhd = q_NHWhd / self.temperature.sqrt()
+            k_NHWhd = k_NHWhd / self.temperature.sqrt()
         x_NhLd = F.scaled_dot_product_attention(
             rearrange(q_NHWhd, "N H W h d -> N h (H W) d"),
             rearrange(k_NHWhd, "N H W h d -> N h (H W) d"),
@@ -154,8 +162,8 @@ class ViTClassifier(nn.Module):
                 UniformRoPEConfig(
                     n_heads=1,
                     head_dim=dim,
-                    min_freq=1.0,
-                    max_freq=100.0,
+                    min_freq=0.5,
+                    max_freq=50.0,
                 ),
                 nh=image_size[0] // patch_size,
                 nw=image_size[1] // patch_size,
@@ -275,7 +283,10 @@ class Trainer:
         elif cfg.pos_emb == "axial_rotary":
             pos_emb = AxialRoPE(
                 AxialRoPEConfig(
-                    head_dim=cfg.head_dim, min_freq=cfg.min_freq, max_freq=cfg.max_freq
+                    head_dim=cfg.head_dim,
+                    min_freq=cfg.min_freq,
+                    max_freq=cfg.max_freq,
+                    n_zero_freqs=cfg.n_zero_freqs,
                 ),
                 nh,
                 nw,
@@ -288,6 +299,7 @@ class Trainer:
                     head_dim=cfg.head_dim,
                     min_freq=cfg.min_freq,
                     max_freq=cfg.max_freq,
+                    n_zero_freqs=cfg.n_zero_freqs,
                     direction_spacing=cfg.direction_spacing,
                     learnable=cfg.learnable_rope,
                 ),
