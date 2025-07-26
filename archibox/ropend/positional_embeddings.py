@@ -41,8 +41,8 @@ class FixedSinCosPE(nn.Module):
         omega_F = cfg.min_freq * (cfg.max_freq / cfg.min_freq) ** torch.linspace(
             0, 1, n_freqs
         )
-        y_HW = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
         x_HW = torch.linspace(-1, 1, nw).reshape(1, nw).expand(nh, nw)
+        y_HW = torch.linspace(-1, 1, nh).reshape(nh, 1).expand(nh, nw)
         emb = torch.cat(
             [
                 torch.cos(y_HW.unsqueeze(-1) * omega_F),
@@ -53,6 +53,18 @@ class FixedSinCosPE(nn.Module):
             dim=-1,
         )
         self.register_buffer("embed_HWD", emb)
+
+    def resize_to(self, size: int | tuple[int, int], orig_size: int | tuple[int, int]):
+        orig_size = (orig_size, orig_size) if isinstance(orig_size, int) else orig_size
+        orig_nh, orig_nw = self.embed_HWD.shape[:2]
+        assert orig_size[0] // orig_nh == orig_size[1] // orig_nw
+        patch_size = orig_size[0] // orig_nh
+        if isinstance(size, int):
+            size = (size, size)
+        nh, nw = size[0] // patch_size, size[1] // patch_size
+
+        new_pe = FixedSinCosPE(self.cfg, nh, nw)
+        self.register_buffer("embed_HWD", new_pe.embed_HWD)
 
     def forward(self, input_NHWD: torch.Tensor) -> torch.Tensor:
         return input_NHWD + self.embed_HWD.type_as(input_NHWD)
@@ -104,27 +116,32 @@ class AxialRoPE(nn.Module):
         cfg = self.cfg
 
         orig_size = (orig_size, orig_size) if isinstance(orig_size, int) else orig_size
-        orig_nh, orig_nw = self.cos_HWhF.shape[:2]
+        orig_nh, orig_nw = self.cos_HW1F.shape[:2]
         assert orig_size[0] // orig_nh == orig_size[1] // orig_nw
         patch_size = orig_size[0] // orig_nh
-
         if isinstance(size, int):
             size = (size, size)
-
         nh, nw = size[0] // patch_size, size[1] // patch_size
-        ylim = size[0] / orig_size[0] * math.sqrt(orig_size[0] / orig_size[1])
-        xlim = size[1] / orig_size[1] * math.sqrt(orig_size[1] / orig_size[0])
+
+        # Canvas extrapolation (larger image with more stuff)
+        # xlim = size[1] / orig_size[1] * math.sqrt(orig_size[1] / orig_size[0])
+        # ylim = size[0] / orig_size[0] * math.sqrt(orig_size[0] / orig_size[1])
+
+        # Scale extrapolation (higher resolution of same image)
+        xlim = math.sqrt(orig_size[1] / orig_size[0])
+        ylim = math.sqrt(orig_size[0] / orig_size[1])
+
         x_HW = torch.linspace(-xlim, xlim, nw).reshape(1, nw).expand(nh, nw)
         y_HW = torch.linspace(-ylim, ylim, nh).reshape(nh, 1).expand(nh, nw)
         omega = cfg.min_freq * (cfg.max_freq / cfg.min_freq) ** torch.linspace(
             0, 1, cfg.head_dim // 4
         )
-        # TODO: change to x and then y to match uniform RoPE
-        theta_HWF = torch.cat(
+        theta_HW1F = torch.cat(
             (y_HW.unsqueeze(-1) * omega, x_HW.unsqueeze(-1) * omega), dim=-1
-        )
-        self.register_buffer("cos_HW1F", torch.cos(theta_HWF).unsqueeze(-2))
-        self.register_buffer("sin_HW1F", torch.sin(theta_HWF).unsqueeze(-2))
+        ).unsqueeze(-2)
+        device, dtype = self.cos_HW1F.device, self.cos_HW1F.dtype
+        self.register_buffer("cos_HW1F", torch.cos(theta_HW1F).to(device, dtype))
+        self.register_buffer("sin_HW1F", torch.sin(theta_HW1F).to(device, dtype))
 
     def forward(self, input_NHWhd: torch.Tensor) -> torch.Tensor:
         x_NHWhF, y_NHWhF = input_NHWhd.float().chunk(2, dim=-1)
@@ -228,16 +245,20 @@ class UniformRoPE(nn.Module):
             orig_nh, orig_nw = self.cos_HWhF.shape[:2]
         assert orig_size[0] // orig_nh == orig_size[1] // orig_nw
         patch_size = orig_size[0] // orig_nh
-
         if isinstance(size, int):
             size = (size, size)
-
         nh, nw = size[0] // patch_size, size[1] // patch_size
-        ylim = size[0] / orig_size[0] * math.sqrt(orig_size[0] / orig_size[1])
-        xlim = size[1] / orig_size[1] * math.sqrt(orig_size[1] / orig_size[0])
 
-        yy_HW = torch.linspace(-ylim, ylim, nh).reshape(nh, 1).expand(nh, nw)
+        # Canvas extrapolation (larger image with more stuff)
+        # ylim = size[0] / orig_size[0] * math.sqrt(orig_size[0] / orig_size[1])
+        # xlim = size[1] / orig_size[1] * math.sqrt(orig_size[1] / orig_size[0])
+
+        # Scale extrapolation (higher resolution of same image)
+        xlim = math.sqrt(orig_size[1] / orig_size[0])
+        ylim = math.sqrt(orig_size[0] / orig_size[1])
+
         xx_HW = torch.linspace(-xlim, xlim, nw).reshape(1, nw).expand(nh, nw)
+        yy_HW = torch.linspace(-ylim, ylim, nh).reshape(nh, 1).expand(nh, nw)
         positions_HW112 = torch.stack((yy_HW, xx_HW), dim=-1).reshape(nh, nw, 1, 1, 2)
         if cfg.learnable:
             device, dtype = self.positions_HW112.device, self.positions_HW112.dtype

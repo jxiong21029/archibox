@@ -55,12 +55,12 @@ class Config(BaseModel):
     head_dim: int = 64
     depth: int = 12
     pos_emb: Literal["absolute", "fixed", "axial_rotary", "uniform_rotary"] = (
-        "uniform_rotary"
+        "axial_rotary"
     )
     ape_init_std: float = 0.5
     min_freq: float = 0.2
     max_freq: float = 20.0
-    n_zero_freqs: int = 0
+    n_zero_freqs: int = 16
     # For Mixed RoPE, set direction_spacing = None, learnable_rope = True
     direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
     learnable_rope: bool = False
