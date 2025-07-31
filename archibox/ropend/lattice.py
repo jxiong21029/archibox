@@ -1,25 +1,20 @@
-import math
-
 import torch
 
 
-def uniform_directions(N: int, D: int) -> torch.Tensor:
-    # Quasi-random samples from the uniform distribution using Kronecker sequences
-    primes = [2, 3, 5, 7, 11, 13, 17, 19]
-    x = 23
-    while len(primes) < D:
-        if all(x % p != 0 for p in primes):
-            primes.append(x)
-        x += 2
-    z = torch.outer(
-        torch.arange(1, N + 1),
-        torch.sqrt(torch.tensor(primes[:D], dtype=torch.float64)),
-    )
+def _phi(m: int) -> float:
+    x = 2.0
+    for _ in range(10):
+        x = (1 + x) ** (1.0 / (m + 1.0))
+    return x
 
-    # Maps samples from U[0, 1] to N(0, 1)
-    z = math.sqrt(2) * torch.erfinv(2 * z.fmod(1.0) - 1)
 
-    directions = z / z.norm(dim=1, keepdim=True)
+def uniform_directions(n: int, d: int) -> torch.Tensor:
+    g = _phi(d)
+    alpha = (1.0 / g) ** torch.arange(1, d + 1, dtype=torch.float64)
+    i = torch.arange(1, n + 1, dtype=torch.float64).unsqueeze(1)
+    z = torch.fmod(i * alpha, 1.0)
+    directions = torch.erfinv(2.0 * z - 1.0)
+    directions = directions / directions.norm(dim=1, keepdim=True)
     return directions.float()
 
 
@@ -30,14 +25,21 @@ def main():
 
     fig = plt.figure()
     ax = fig.add_subplot(projection="3d")
-    xs, ys, zs = uniform_directions(N=32, D=3).unbind(-1)
+    xs, ys, zs = uniform_directions(n=4096, d=3).unbind(-1)
+    # directions = torch.randn(4096, 3)
+    # directions = directions / directions.norm(dim=1, keepdim=True)
+    # xs, ys, zs = directions.unbind(-1)
 
-    ax.scatter(xs.numpy().tolist(), ys.numpy().tolist(), zs.numpy().tolist())
-    ax.set_xlim(-1, 1)
-    ax.set_ylim(-1, 1)
-    ax.set_zlim(-1, 1)
+    ax.scatter(xs.numpy().tolist(), ys.numpy().tolist(), zs.numpy().tolist(), s=1)
+    ax.set_box_aspect(
+        (
+            (xs.max() - xs.min()).item(),
+            (ys.max() - ys.min()).item(),
+            (zs.max() - zs.min()).item(),
+        )
+    )
 
-    fig.savefig(Path(__file__).parent / "figures/lattice.png")
+    fig.savefig(Path(__file__).parent / "figures/lattice.png", dpi=500)
 
 
 if __name__ == "__main__":
