@@ -189,13 +189,15 @@ class UniformRoPEConfig(BaseModel):
     min_freq: float
     max_freq: float
     n_zero_freqs: int = 0
-    direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
+    direction_spacing: float | None = math.pi * (1 - math.sqrt(5)) / 2
     learnable: bool = False
 
     variant: Literal["uniform_rotary"] = "uniform_rotary"
 
 
 class UniformRoPE(nn.Module):
+    """Implementation of uniform RoPE, also supports random init and learnable."""
+
     def __init__(self, cfg: UniformRoPEConfig, nh: int, nw: int):
         super().__init__()
         self.cfg = cfg

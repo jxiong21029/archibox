@@ -52,7 +52,9 @@ class Config(BaseModel):
     min_freq: float = 1.0
     max_freq: float = 100.0
     n_zero_freqs: int = 0
-    direction_spacing: float | None = math.pi * (1 - math.sqrt(5))
+    # NOTE: experiments used direction_spacing = pi * (1 - sqrt(5)); but pi * (1 -
+    # sqrt(5)) / 2 should perform better
+    direction_spacing: float | None = math.pi * (1 - math.sqrt(5)) / 2
     learnable_rope: bool = False
     sep_rope_heads: bool = True
     pooling: Literal["mean", "rotary", "attention"] = "mean"
