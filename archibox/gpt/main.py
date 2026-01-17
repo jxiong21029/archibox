@@ -1,282 +1,192 @@
 import argparse
+import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
+import einops as eo
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import wandb
-from omegaconf import OmegaConf
+from bnnp import DistMuon, Metrics
+from bnnp.nn import Embedding, FusedLinear, Output, RMSNorm, RoPE1d, mpparam
+from pydantic import BaseModel, ConfigDict
 from torch import Tensor
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from archibox.components import FusedLinear, ReLU2, RMSNorm
-from archibox.metrics import Metrics
-from archibox.muon import Muon
-
-log = logging.getLogger(__name__)
-flex_attention = torch.compile(flex_attention, dynamic=False)
+logger = logging.getLogger(__name__)
+rank0logger = logging.getLogger(f"{__name__}.rank0")
+metrics = Metrics(use_wandb=False, enabled=False, use_cuda_events=True)
 
 
-@dataclass
-class Config:
+class Config(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    run_name: str | None = None
+    runs_dir: Path = Path(__file__).parent / "runs"
     n_steps: int = 2000
     seq_len: int = 4 * 1024
-    seq_len_valid: int = 4 * 1024
     valid_every: int = 125
     valid_tokens: int = 10 * 1024 * 1024
 
     dim: int = 768
+    head_dim: int = 64
+    mlp_dim: int = 3072
     depth: int = 12
+    temperature: Literal["affine", "scalar"] | None = "scalar"
     vocab_size: int = 50257
 
-    muon_lr: float = 0.03
+    muon_lr: float = 0.01
     muon_mu: float = 0.95
-    muon_wd: float = 0.01
     scalar_lr: float = 0.003
     embeds_lr: float = 0.003
-    output_lr: float = 0.003
-    adamw_mu1: float = 0.95
-    adamw_mu2: float = 0.99
-    adamw_wd: float = 0.01
+    adamw_betas: tuple[float, float] = (0.95, 0.99)
+    weight_decay: float = 0.01
     lr_cooldown_start: int = 1200
-    lr_cooldown_ratio: float = 0.1
+    lr_cooldown_ratio: float = 0.0
+
+    compile_mode: str | None = "default"
+    dtype: str = "bfloat16"
+    use_wandb: bool = True
+    seed: int = 0
 
 
-# TODO: value residuals
-# Temporary experiment stuff...
-MLP_ACTIVATION = ReLU2
-
-
-class DecoderLayer(nn.Module):
+class DecoderAttention(nn.Module):
     def __init__(
         self,
         dim: int,
         head_dim: int,
-        mlp_dim: int,
-        seq_len: int,
-        window_size: int,
-        use_rope: bool,
-        rope_base: float,
-        resid_scale: bool,
+        rope: RoPE1d,
+        temperature: Literal["affine", "scalar"] | None = "scalar",
+        exnorm: bool = True,
     ):
         assert head_dim % 4 == 0
         super().__init__()
         self.dim = dim
         self.head_dim = head_dim
-        self.nheads = dim // head_dim
-        self.seq_len = seq_len  # training sequence length
-        self.window_size = window_size  # max number of tokens to attend to
-        self.use_rope = use_rope  # whether to apply rotary positional embeddings
-        self.rope_base = rope_base  # maximum period of rope / 2pi
+        self.n_heads = dim // head_dim
+        self.exnorm = exnorm
+        self.temperature = temperature
 
-        self.attn_norm = RMSNorm(dim, affine=False)
-        self.qkv_w = nn.Parameter(torch.randn(3, dim, dim) / dim**0.5 / 2)
-        self.qk_norm = RMSNorm(head_dim, affine=False)
-        self.o_proj = FusedLinear(dim, dim, scale=resid_scale, zero_init=True)
+        self.in_norm = RMSNorm(dim, affine=False)
+        self.qkv_weight = mpparam(3, dim, dim)
+        if temperature == "scalar":
+            self.temp_invm1 = nn.Parameter(torch.zeros(head_dim))
+        self.q_norm = RMSNorm(head_dim, affine=temperature == "affine")
+        self.k_norm = RMSNorm(head_dim, affine=temperature == "affine")
+        self.rope = rope
+        self.o_proj = FusedLinear(dim, dim, zero_init=True)
 
-        if use_rope:
-            freqs = (1 / rope_base) ** torch.linspace(
-                0, 1, head_dim // 4, dtype=torch.float32
-            )
-            # Used during inference
-            self.freqs_d = nn.Buffer(
-                torch.cat((freqs, freqs.new_zeros(head_dim // 4))), persistent=False
-            )
-            theta_1T1d = torch.outer(torch.arange(seq_len), self.freqs_d).reshape(
-                1, seq_len, 1, head_dim // 2
-            )
-            # Used during training
-            self.cos_1T1d = nn.Buffer(torch.cos(theta_1T1d), persistent=False)
-            self.sin_1T1d = nn.Buffer(torch.sin(theta_1T1d), persistent=False)
-
-        def sliding_window_causal(b, h, q_idx, kv_idx):
-            return (kv_idx <= q_idx) & (q_idx < kv_idx + window_size)
-
-        self.block_mask = create_block_mask(
-            sliding_window_causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len
-        )
-
-        self.mlp = nn.Sequential(
-            RMSNorm(dim, affine=False),
-            FusedLinear(dim, mlp_dim),
-            MLP_ACTIVATION(),
-            FusedLinear(mlp_dim, dim, scale=resid_scale, zero_init=True),
-        )
-
-    def rotary(self, x_NTHD):
-        """Training rotary embedding (known seq_len, cached cos/sin)"""
-        assert x_NTHD.ndim == 4
-        assert x_NTHD.size(1) == self.seq_len
-        x1_NTHd, x2_NTHd = x_NTHD.float().chunk(2, dim=-1)
-        y1_NTHd = x1_NTHd * self.cos_1T1d + x2_NTHd * self.sin_1T1d
-        y2_NTHd = x1_NTHd * (-self.sin_1T1d) + x2_NTHd * self.cos_1T1d
-        return torch.cat([y1_NTHd, y2_NTHd], dim=-1).type_as(x_NTHD)
-
-    def inference_rotary(self, x_NHD, t: int):
-        """Inference rotary embedding (one input token)"""
-        assert x_NHD.ndim == 3
-        assert t >= 0
-        theta_d = t * self.freqs_d
-        cos_d = torch.cos(theta_d)
-        sin_d = torch.sin(theta_d)
-        x1_NHd, x2_NHd = x_NHD.float().chunk(2, dim=-1)
-        y1_NHd = x1_NHd * cos_d + x2_NHd * sin_d
-        y2_NHd = x1_NHd * (-sin_d) + x2_NHd * cos_d
-        return torch.cat([y1_NHd, y2_NHd], dim=-1).type_as(x_NHD)
-
-    def forward(self, x_NTD: Tensor):
-        """Training forward (fixed seq_len, no past_kv)"""
-        N, T, _ = x_NTD.shape
-        input_NTD = x_NTD
-        qkv = self.attn_norm(x_NTD) @ self.qkv_w.flatten(0, 1).type_as(x_NTD).t()
-        q_NTHD, k_NTHD, v_NTHD = qkv.view(N, T, 3 * self.nheads, -1).chunk(3, dim=2)
-        q_NTHD, k_NTHD = self.qk_norm(q_NTHD), self.qk_norm(k_NTHD)
-        if self.use_rope:
-            q_NTHD, k_NTHD = self.rotary(q_NTHD), self.rotary(k_NTHD)
-        x_NHTD = flex_attention(
-            q_NTHD.transpose(1, 2),
-            k_NTHD.transpose(1, 2),
-            v_NTHD.transpose(1, 2),
-            block_mask=self.block_mask,
-        )
-        x_NTD = x_NHTD.transpose(1, 2).reshape(N, T, self.dim)
-        x_NTD = input_NTD + self.o_proj(x_NTD)
-
-        x_NTD = x_NTD + self.mlp(x_NTD)
-        return x_NTD
-
-    def predict(
-        self, x_ND: Tensor, past_kv: tuple[Tensor, Tensor] | None, t: int | None = None
+    def forward(
+        self, input_BTD: Tensor, rotations: tuple[Tensor, Tensor], block_mask: BlockMask
     ):
-        """Inference (one input token, optional past_kv). Returns new kv."""
-        N, _ = x_ND.shape
-        input_ND = x_ND
-        qkv = self.attn_norm(x_ND) @ self.qkv_w.flatten(0, 1).type_as(x_ND).t()
-        q_NHD, k_NHD, v_NHD = qkv.view(N, 3 * self.nheads, -1).chunk(3, dim=1)
-        q_NHD, k_NHD = self.qk_norm(q_NHD), self.qk_norm(k_NHD)
-
-        if self.use_rope:
-            assert t is not None
-            q_NHD = self.inference_rotary(q_NHD, t)
-            k_NHD = self.inference_rotary(k_NHD, t)
-        else:
-            assert t is None
-
-        if past_kv is not None:
-            past_k_NHTD, past_v_NHTD = past_kv
-            k_NHTD = torch.cat([past_k_NHTD, k_NHD.unsqueeze(2)], dim=2)
-            v_NHTD = torch.cat([past_v_NHTD, v_NHD.unsqueeze(2)], dim=2)
-        else:
-            k_NHTD = k_NHD.unsqueeze(2)
-            v_NHTD = v_NHD.unsqueeze(2)
-        x_NHTD = F.scaled_dot_product_attention(q_NHD.unsqueeze(2), k_NHTD, v_NHTD)
-        x_ND = x_NHTD[:, :, -1, :].flatten(1, 2)
-        x_ND = input_ND + self.o_proj(x_ND)
-
-        x_ND = x_ND + self.mlp(x_ND)
-        return x_ND, (
-            k_NHTD[:, :, -self.window_size + 1 :],
-            v_NHTD[:, :, -self.window_size + 1 :],
+        B, T, _ = input_BTD.shape
+        x_BTD = self.in_norm(input_BTD)
+        qkv_weight = self.qkv_weight.flatten(0, 1).type_as(input_BTD)
+        q_BThd, k_BThd, v_BThd = (
+            (x_BTD @ qkv_weight.t())
+            .view(B, T, 3 * self.n_heads, self.head_dim)
+            .chunk(3, dim=-2)
         )
+        if self.temperature == "scalar":
+            scale = self.temp_invm1.add(1).sqrt()
+            q_BThd = self.rope(self.q_norm(q_BThd) * scale, *rotations)
+            k_BThd = self.rope(self.k_norm(k_BThd) * scale, *rotations)
+        else:
+            q_BThd = self.rope(self.q_norm(q_BThd), *rotations)
+            k_BThd = self.rope(self.k_norm(k_BThd), *rotations)
+
+        o_BhTd = flex_attention(
+            q_BThd.transpose(1, 2),
+            k_BThd.transpose(1, 2),
+            v_BThd.transpose(1, 2),
+            block_mask=block_mask,
+        )
+        o_BTD = eo.rearrange(o_BhTd, "B h T d -> B T (h d)")
+        o_BTD = self.o_proj(x_BTD)
+
+        if self.exnorm:
+            post_scale = o_BTD.square().mean(dim=-1, keepdim=True).add(1).rsqrt()
+            return post_scale * (input_BTD + o_BTD)
+        return input_BTD + o_BTD
 
 
-class Decoder(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        head_dim: int,
-        mlp_dim: int,
-        depth: int,
-        seq_len: int,
-        window_size: int,
-        use_rope: bool,
-        rope_base: float,
-        resid_scale: bool,
-    ):
+class MLP(nn.Module):
+    def __init__(self, dim: int, mlp_dim: int, exnorm: bool = True):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                DecoderLayer(
-                    dim=dim,
-                    head_dim=head_dim,
-                    mlp_dim=mlp_dim,
-                    seq_len=seq_len,
-                    window_size=window_size,
-                    use_rope=use_rope,
-                    rope_base=rope_base,
-                    resid_scale=resid_scale,
-                )
-                for _ in range(depth)
-            ]
-        )
+        self.dim = dim
+        self.mlp_dim = mlp_dim
+        self.exnorm = exnorm
 
-    def forward(self, x_NTD: Tensor):
-        """Training forward (fixed seq_len, no kv_cache)"""
-        for layer in self.layers:
-            x_NTD = layer(x_NTD)
-        return x_NTD
+        self.in_norm = RMSNorm(dim, affine=False)
+        self.up_proj = FusedLinear(dim, mlp_dim)
+        self.down_proj = FusedLinear(mlp_dim, dim, zero_init=True)
 
-    def predict(
-        self,
-        x: Tensor,
-        kv_cache: list[tuple[Tensor, Tensor]] | None,
-        t: int | None = None,
-    ):
-        """Inference (one input token, optional kv_cache). Returns new kv_cache"""
-        if kv_cache is None:
-            kv_cache = [None for _ in range(len(self.layers))]
-        new_kv_cache = []
-
-        for layer, past_kv in zip(self.layers, kv_cache, strict=True):
-            x, new_kv = layer.predict(x, past_kv, t)
-            new_kv_cache.append(new_kv)
-        return x, new_kv_cache
+    def forward(self, input_BTD: Tensor):
+        x_BTD = self.in_norm(input_BTD)
+        x_BTD = self.up_proj(x_BTD)
+        x_BTD = F.relu(x_BTD).square()
+        x_BTD = self.down_proj(x_BTD)
+        if self.exnorm:
+            post_scale = x_BTD.square().mean(dim=-1, keepdim=True).add(1).rsqrt()
+            return post_scale * (input_BTD + x_BTD)
+        return input_BTD + x_BTD
 
 
 class GPT(nn.Module):
     def __init__(
         self,
+        vocab_size: int,
         dim: int,
+        head_dim: int,
         mlp_dim: int,
         depth: int,
-        seq_len: int,
-        window_size: int,
-        vocab_size: int,
+        temperature: Literal["affine", "scalar"] | None = "scalar",
+        exnorm: bool = True,
     ):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, dim)
-        self.embed.weight.data.mul_(0.5)
+        self.embed = Embedding(vocab_size, dim)
 
-        self.vocab_size = vocab_size
-        self.decoder = Decoder(
-            dim=dim,
-            head_dim=64,
-            mlp_dim=mlp_dim,
-            depth=depth,
-            seq_len=seq_len,
-            window_size=window_size,
-            use_rope=True,
-            rope_base=1024.0,
-            resid_scale=True,
+        self.rope = RoPE1d(
+            head_dim=head_dim,
+            min_freq=0.001,
+            max_freq=1.0,
+            p_zero_freqs=0.5,
         )
 
-        out_dim = (vocab_size + 127) // 128 * 128
-        self.lm_head = FusedLinear(dim, out_dim, scale=True)
-        self.lm_head.scale.data.zero_()
+        self.blocks = []
+        for _ in range(depth):
+            block = nn.ModuleDict()
+            block["attn"] = DecoderAttention(
+                dim=dim,
+                head_dim=head_dim,
+                rope=self.rope,
+                temperature=temperature,
+                exnorm=exnorm,
+            )
+            block["mlp"] = MLP(dim=dim, mlp_dim=mlp_dim, exnorm=exnorm)
+            self.blocks.append(block)
+        self.out_head = Output(dim, vocab_size)
 
-    def forward(self, input_ids, target_ids):
-        assert input_ids.ndim == 1
-        x_NTD = self.embed(input_ids.unsqueeze(0)).to(torch.bfloat16)
-        x_NTD, _ = self.decoder(x_NTD)
-        logits_NTD = self.lm_head(x_NTD)
-        loss = F.cross_entropy(logits_NTD.squeeze(0), target_ids)
-        return loss
+    def forward(self, input_ids_BT: Tensor):
+        x_BTD = self.embed(input_ids_BT)
+
+        for block in self.blocks:
+            x_BTD = block["attn"](x_BTD)
+            x_BTD = block["mlp"](x_BTD)
+
+        return self.out_head(x_BTD)
 
 
 def _load_data_shard(file: Path):
@@ -314,101 +224,92 @@ def distributed_data_generator(seq_len: int, rank: int, world_size: int, valid: 
 class Trainer:
     def __init__(self, cfg: Config, use_wandb: bool, do_compile: bool):
         self.cfg = cfg
-        self.use_wandb = use_wandb
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[%(asctime)s][%(name)s:%(levelname)s] %(message)s",
+        )
 
-        self.rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.is_main_process = self.rank == 0
-        self.world_size = int(os.environ["WORLD_SIZE"])
-        self.device = torch.device("cuda", local_rank)
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.is_distributed = self.world_size > 1
+        self.device = torch.device("cuda", self.local_rank)
+        metrics.enabled = self.is_main_process
         torch.cuda.set_device(self.device)
-        dist.init_process_group(backend="nccl", device_id=self.device)
+        local_seed = 0x30005 * cfg.seed + self.rank
+        torch.manual_seed(local_seed)
+        torch.cuda.manual_seed(local_seed)
+        rank0logger.setLevel(logging.INFO if self.is_main_process else logging.ERROR)
+        rank0logger.info("Config: " + str(json.dumps(cfg.model_dump(), indent=4)))
 
-        if self.is_main_process and use_wandb:
-            Path("runs/gpt").mkdir(exist_ok=True)
+        run_base_dir = Path(cfg.runs_dir)
+        run_base_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main_process and cfg.use_wandb:
             wandb.init(
-                project="archibox",
-                group="gpt",
-                dir="runs/gpt",
-                config=OmegaConf.to_container(OmegaConf.structured(self.cfg)),
+                entity="archibox",
+                project="nanogpt",
+                name=cfg.run_name,
+                dir=run_base_dir,
+                config=cfg.model_dump(),
+                resume="never",
             )
+            metrics.use_wandb = True
+            assert wandb.run is not None
+            self.run_dir = Path(wandb.run.dir)
+        else:
+            self.run_dir = run_base_dir / "local"
+        if self.is_main_process:
+            self.run_dir.mkdir(exist_ok=True)
+        if self.is_distributed:
+            dist.init_process_group(backend="nccl", device_id=self.device)
+        else:
+            assert self.rank == self.local_rank == 0
 
-        torch.manual_seed(self.rank)
-        torch.cuda.manual_seed(self.rank)
+        if self.is_main_process:
+            self.info = dict(
+                commit_hash=subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"], text=True
+                ).strip(),
+                diff=subprocess.check_output(
+                    ["git", "diff", "HEAD"], text=True
+                ).strip(),
+                hostname=subprocess.check_output(["hostname"], text=True).strip(),
+                nvidia_smi=subprocess.check_output(["nvidia-smi"], text=True).strip(),
+            )
+            rank0logger.info(f"git commit hash: {self.info['commit_hash']}")
+            rank0logger.info(f"git diff:\n{self.info['diff']}")
+            rank0logger.info(f"running on host: {self.info['hostname']}")
+            rank0logger.info(f"nvidia-smi:\n{self.info['nvidia_smi']}")
 
-        self.metrics = Metrics(enabled=self.is_main_process, use_wandb=use_wandb)
-        self.metrics.context = "train_"
+        self.dtype = dict(
+            bfloat16=torch.bfloat16, float16=torch.float16, float32=torch.float32
+        )[cfg.dtype]
 
         self.train_loader = distributed_data_generator(
             cfg.seq_len, self.rank, self.world_size, valid=False
         )
 
-        model = GPT(cfg.dim, cfg.depth, cfg.vocab_size).to(self.device)
+        model = GPT(
+            vocab_size=cfg.vocab_size,
+            dim=cfg.dim,
+            head_dim=cfg.head_dim,
+            mlp_dim=cfg.mlp_dim,
+            depth=cfg.depth,
+            temperature=cfg.temperature,
+        ).to(self.device)
         self.raw_model = model
         if do_compile:
             model = torch.compile(model)
         self.model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-        scalar_params = []
-        embeds_params = []
-        output_params = []
-        muon_params = []
-        for name, p in self.raw_agent.named_parameters():
-            shape = tuple(p.shape)
-            if not p.requires_grad:
-                self.log_once(f"{name} {shape} requires_grad=False, skipped")
-                continue
-            elif p.ndim < 2:
-                self.log_once(f"{name} {shape} assigned to AdamW")
-                scalar_params.append(p)
-            elif hasattr(p, "_is_embed") and p._is_embed:
-                self.log_once(f"{name} {shape} (_is_embed=True) assigned to AdamW")
-                embeds_params.append(p)
-            elif hasattr(p, "_is_output") and p._is_output:
-                self.log_once(f"{name} {shape} (_is_output=True) assigned to AdamW")
-                output_params.append(p)
-            else:
-                # _ortho is deprecated but checking here just in case
-                assert not hasattr(p, "_ortho")
-                self.log_once(f"{name}{shape} assigned to Muon")
-                muon_params.append(p)
-        if self.is_main_process:
-            total_params = sum(
-                p.numel()
-                for p in muon_params + scalar_params + embeds_params + output_params
-            )
-            total_param_tensors = sum(
-                len(group)
-                for group in (muon_params, scalar_params, embeds_params, output_params)
-            )
-            log.info(
-                "parameter information:\n"
-                f"- muon params: {sum(p.numel() for p in muon_params):,} over {len(muon_params):,} tensors\n"
-                f"- scalar params: {sum(p.numel() for p in scalar_params):,} over {len(scalar_params):,} tensors\n"
-                f"- embeds params: {sum(p.numel() for p in embeds_params):,} over {len(embeds_params):,} tensors\n"
-                f"- output params: {sum(p.numel() for p in output_params):,} over {len(output_params):,} tensors\n"
-                f"total: {total_params:,} over {total_param_tensors:,} tensors"
-            )
-        adamw_params = [
-            dict(params=scalar_params, lr=self.cfg.scalar_lr),
-            dict(params=embeds_params, lr=self.cfg.embeds_lr),
-            dict(params=output_params, lr=self.cfg.output_lr),
-        ]
-
-        self.muon = Muon(
-            muon_params,
+        self.optimizer = DistMuon(
+            None,
             lr=self.cfg.muon_lr,
             momentum=self.cfg.muon_mu,
             weight_decay=self.cfg.muon_wd,
         )
-        self.adamw = torch.optim.AdamW(
-            adamw_params,
-            betas=[self.cfg.adamw_mu1, self.cfg.adamw_mu2],
-            weight_decay=self.cfg.adamw_wd,
-        )
 
-        self.optims = [self.muon, self.adamw]
-        for opt in self.optims:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]
 
