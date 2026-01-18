@@ -1,4 +1,3 @@
-import argparse
 import json
 import logging
 import os
@@ -33,7 +32,7 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     run_name: str | None = None
-    runs_dir: Path = Path(__file__).parent / "runs"
+    runs_dir: str = str(Path(__file__).parent / "runs")
     n_steps: int = 2000
     seq_len: int = 4 * 1024
     valid_every: int = 125
@@ -361,7 +360,7 @@ class Trainer:
                     f"Parameter {name_shape} has invalid _group attribute: {param._group}"  # pyright: ignore
                 )
             else:
-                group = param._group  # pyright: ignore
+                group = param._group
 
             rank0logger.info(f"Parameter {name_shape} assigned to group {group!r}.")
             param_groups.setdefault(group, []).append(param)
