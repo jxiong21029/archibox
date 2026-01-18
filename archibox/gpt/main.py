@@ -115,7 +115,7 @@ class DecoderAttention(nn.Module):
             block_mask=block_mask,
         )
         o_BTD = eo.rearrange(o_BhTd, "B h T d -> B T (h d)")
-        o_BTD = self.o_proj(x_BTD)
+        o_BTD = self.o_proj(o_BTD)
 
         if self.exnorm:
             post_scale = o_BTD.square().mean(dim=-1, keepdim=True).add(1).rsqrt()
@@ -178,7 +178,7 @@ class GPT(nn.Module):
             )
             block["mlp"] = MLP(dim=dim, mlp_dim=mlp_dim, exnorm=exnorm)
             self.blocks.append(block)
-        self.out_head = Output(dim, vocab_size)
+        self.out_head = Output(dim, vocab_size, pad_to=64)
 
     def precompute_rotations(
         self,
@@ -255,7 +255,7 @@ def distributed_data_generator(
         buf = tokens[ptr + rank * seq_len : ptr + (rank + 1) * seq_len + 1]
         inputs = buf[:-1].to(device=device, dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device=device, dtype=torch.int64, non_blocking=True)
-        ptr += seq_len * rank
+        ptr += seq_len * world_size
         yield inputs, targets
 
 
@@ -418,6 +418,7 @@ class Trainer:
             adamw_betas=cfg.adamw_betas,
             weight_decay=self.cfg.weight_decay,
             nesterov=True,
+            lr_scaling="rms",
         )
         for group in self.optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -427,7 +428,7 @@ class Trainer:
 
     def run(self):
         with tqdm.tqdm(
-            total=self.cfg.n_steps, desc="training", ncols=88, mininterval=3.0
+            total=self.cfg.n_steps, desc="train", ncols=88, mininterval=3.0
         ) as pbar:
             if self.step > 0:
                 pbar.update(self.step)
@@ -456,9 +457,9 @@ class Trainer:
 
         metrics.tick("forward")
         logits, fwd_metrics = self.model(inputs_ids.unsqueeze(0), self.rotations)
-        loss = F.cross_entropy(logits[0], target_ids)
+        loss = F.cross_entropy(logits[0].float(), target_ids)
         assert torch.isfinite(loss)
-        metrics.push(train_loss=loss, **fwd_metrics)
+        metrics.push(loss=loss, **fwd_metrics)
 
         metrics.tick("backward")
         loss.backward()
@@ -475,10 +476,12 @@ class Trainer:
         valid_loader = distributed_data_generator(
             self.cfg.seq_len, self.rank, self.world_size, valid=True, device=self.device
         )
-        for _ in range(self.cfg.valid_batches):
+        for _ in tqdm.trange(
+            self.cfg.valid_batches, desc="valid", ncols=88, mininterval=3.0
+        ):
             input_ids, target_ids = next(valid_loader)
             logits, fwd_metrics = self.model(input_ids.unsqueeze(0), self.rotations)
-            loss = F.cross_entropy(logits[0], target_ids)
+            loss = F.cross_entropy(logits[0].float(), target_ids)
             metrics.push(loss=loss, **fwd_metrics)
 
         self.model.train()
