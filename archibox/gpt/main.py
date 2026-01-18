@@ -83,6 +83,7 @@ class DecoderAttention(nn.Module):
         self.qkv_weight = mpparam(3, dim, dim)
         if temperature == "scalar":
             self.temp_invm1 = nn.Parameter(torch.zeros(head_dim))
+            self.temp_invm1._group = "scalar"  # ty: ignore
         self.q_norm = RMSNorm(head_dim, affine=temperature == "affine")
         self.k_norm = RMSNorm(head_dim, affine=temperature == "affine")
         self.rope = rope
@@ -209,6 +210,7 @@ class GPT(nn.Module):
         )
 
         for block in self.blocks:
+            assert isinstance(block, nn.ModuleDict)
             x_BTD = block["attn"](x_BTD, rotations, block_mask=block_mask)
             x_BTD = block["mlp"](x_BTD)
         assert x_BTD.dtype == self.dtype
