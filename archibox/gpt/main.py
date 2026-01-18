@@ -33,7 +33,7 @@ class Config(BaseModel):
 
     run_name: str | None = None
     runs_dir: str = str(Path(__file__).parent / "runs")
-    n_steps: int = 2000
+    n_steps: int = 20_000
     seq_len: int = 64 * 1024
     valid_every: int = 250
     valid_batches: int = 160
@@ -46,14 +46,14 @@ class Config(BaseModel):
     temperature: Literal["affine", "scalar"] | None = "scalar"
     exnorm: bool = False
 
-    muon_lr: float = 0.005
+    muon_lr: float = 0.008
     muon_mu: float = 0.95
     embed_lr: float = 0.01
     scalar_lr: float = 0.01
     low_rank_lr: float = 0.001
     adamw_betas: tuple[float, float] = (0.95, 0.99)
-    weight_decay: float = 0.01
-    lr_cooldown_start: int = 1200
+    weight_decay: float = 0.1
+    lr_cooldown_start: int = 12_000
     lr_cooldown_ratio: float = 0.0
 
     compile_mode: str | None = "default"
@@ -196,8 +196,11 @@ class GPT(nn.Module):
     def forward(self, input_ids_BT: Tensor, rotations: tuple[Tensor, Tensor]):
         B, T = input_ids_BT.size()
         assert B == 1
+        metrics = {}
 
         x_BTD = self.embed(input_ids_BT).to(self.dtype)
+        with torch.no_grad():
+            metrics["embed_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
 
         docs = (input_ids_BT[0] == 50256).cumsum(0)
 
@@ -218,7 +221,6 @@ class GPT(nn.Module):
         assert x_BTD.dtype == self.dtype
 
         logits = self.out_head(x_BTD)
-        metrics = {}
         with torch.no_grad():
             metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
         return logits, metrics
@@ -459,7 +461,7 @@ class Trainer:
         logits, fwd_metrics = self.model(inputs_ids.unsqueeze(0), self.rotations)
         loss = F.cross_entropy(logits[0].float(), target_ids)
         assert torch.isfinite(loss)
-        metrics.push(loss=loss, **fwd_metrics)
+        metrics.push(loss=loss, logits_std=logits.std(), **fwd_metrics)
 
         metrics.tick("backward")
         loss.backward()
@@ -482,7 +484,7 @@ class Trainer:
             input_ids, target_ids = next(valid_loader)
             logits, fwd_metrics = self.model(input_ids.unsqueeze(0), self.rotations)
             loss = F.cross_entropy(logits[0].float(), target_ids)
-            metrics.push(loss=loss, **fwd_metrics)
+            metrics.push(loss=loss, logits_std=logits.std(), **fwd_metrics)
 
         self.model.train()
         metrics.context = "train_"
