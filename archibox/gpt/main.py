@@ -237,7 +237,9 @@ def _load_data_shard(file: Path):
     return tokens
 
 
-def distributed_data_generator(seq_len: int, rank: int, world_size: int, valid: bool):
+def distributed_data_generator(
+    seq_len: int, rank: int, world_size: int, valid: bool, device: torch.device
+):
     basedir = Path(__file__).parent / "data/fineweb10B"
     files = sorted(basedir.glob(f"fineweb_{'val' if valid else 'train'}_*.bin"))
     file_iter = iter(files)
@@ -248,8 +250,8 @@ def distributed_data_generator(seq_len: int, rank: int, world_size: int, valid: 
             tokens = _load_data_shard(next(file_iter))
             ptr = 0
         buf = tokens[ptr + rank * seq_len : ptr + (rank + 1) * seq_len + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        inputs = buf[:-1].to(device=device, dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device=device, dtype=torch.int64, non_blocking=True)
         ptr += seq_len * rank
         yield inputs, targets
 
@@ -320,7 +322,7 @@ class Trainer:
         )[cfg.dtype]
 
         self.train_loader = distributed_data_generator(
-            cfg.seq_len, self.rank, self.world_size, valid=False
+            cfg.seq_len, self.rank, self.world_size, valid=False, device=self.device
         )
 
         model = GPT(
@@ -468,7 +470,7 @@ class Trainer:
         metrics.context = "valid_"
 
         for input_ids, target_ids in distributed_data_generator(
-            self.cfg.seq_len, self.rank, self.world_size, valid=True
+            self.cfg.seq_len, self.rank, self.world_size, valid=True, device=self.device
         ):
             logits, fwd_metrics = self.model(input_ids.unsqueeze(0), self.rotations)
             loss = F.cross_entropy(logits, target_ids)
