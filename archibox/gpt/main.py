@@ -28,9 +28,6 @@ rank0logger = logging.getLogger(f"{__name__}.rank0")
 metrics = Metrics(use_wandb=False, enabled=False, use_cuda_events=True)
 
 
-torch.autograd.set_detect_anomaly(True)  # TODO
-
-
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -51,7 +48,7 @@ class Config(BaseModel):
 
     muon_lr: float = 0.005
     muon_mu: float = 0.95
-    embed_lr: float = 0.1
+    embed_lr: float = 0.01
     scalar_lr: float = 0.005
     low_rank_lr: float = 0.001
     adamw_betas: tuple[float, float] = (0.95, 0.99)
@@ -426,15 +423,18 @@ class Trainer:
                     "scalar": cfg.scalar_lr,
                     "low_rank": cfg.low_rank_lr,
                 }[group],
+                "weight_decay": cfg.weight_decay
+                if group in ("muon", "low_rank")
+                else cfg.weight_decay / (cfg.dim**0.5),
             }
             for group, params in param_groups.items()
         )
         self.optimizer = DistMuon(
             parameters,
-            lr=self.cfg.muon_lr,
-            mu=self.cfg.muon_mu,
+            lr=cfg.muon_lr,
+            mu=cfg.muon_mu,
             adamw_betas=cfg.adamw_betas,
-            weight_decay=self.cfg.weight_decay,
+            weight_decay=cfg.weight_decay,
             nesterov=True,
             lr_scaling="rms",
         )
