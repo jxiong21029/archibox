@@ -28,6 +28,9 @@ rank0logger = logging.getLogger(f"{__name__}.rank0")
 metrics = Metrics(use_wandb=False, enabled=False, use_cuda_events=True)
 
 
+torch.autograd.set_detect_anomaly(True)  # TODO
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -46,17 +49,17 @@ class Config(BaseModel):
     temperature: Literal["affine", "scalar"] | None = "scalar"
     exnorm: bool = False
 
-    muon_lr: float = 0.008
+    muon_lr: float = 0.005
     muon_mu: float = 0.95
-    embed_lr: float = 0.01
+    embed_lr: float = 0.02
     scalar_lr: float = 0.01
     low_rank_lr: float = 0.001
     adamw_betas: tuple[float, float] = (0.95, 0.99)
-    weight_decay: float = 0.1
+    weight_decay: float = 0.01
     lr_cooldown_start: int = 12_000
     lr_cooldown_ratio: float = 0.0
 
-    compile_mode: str | None = "default"
+    compile_mode: str | None = "max-autotune"
     dtype: str = "bfloat16"
     use_wandb: bool = True
     seed: int = 0
