@@ -446,7 +446,7 @@ class Trainer:
         inputs_ids, target_ids = next(self.train_loader)
 
         metrics.tick("forward")
-        logits, fwd_metrics = self.model(inputs_ids, self.rotations)
+        logits, fwd_metrics = self.model(inputs_ids.unsqueeze(0), self.rotations)
         loss = F.cross_entropy(logits, target_ids)
         assert torch.isfinite(loss)
         metrics.push(train_loss=loss, **fwd_metrics)
@@ -466,7 +466,7 @@ class Trainer:
         for input_ids, target_ids in distributed_data_generator(
             self.cfg.seq_len, self.rank, self.world_size, valid=True
         ):
-            logits, fwd_metrics = self.model(input_ids, self.rotations)
+            logits, fwd_metrics = self.model(input_ids.unsqueeze(0), self.rotations)
             loss = F.cross_entropy(logits, target_ids)
             metrics.push(loss=loss, **fwd_metrics)
 
