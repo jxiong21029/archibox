@@ -51,11 +51,11 @@ class Config(BaseModel):
 
     muon_lr: float = 0.005
     muon_mu: float = 0.95
-    embed_lr: float = 0.02
-    scalar_lr: float = 0.01
+    embed_lr: float = 0.01
+    scalar_lr: float = 0.005
     low_rank_lr: float = 0.001
     adamw_betas: tuple[float, float] = (0.95, 0.99)
-    weight_decay: float = 0.01
+    weight_decay: float = 0.1
     lr_cooldown_start: int = 12_000
     lr_cooldown_ratio: float = 0.0
 
@@ -85,8 +85,8 @@ class DecoderAttention(nn.Module):
         self.in_norm = RMSNorm(dim, affine=False)
         self.qkv_weight = mpparam(3, dim, dim)
         if temperature == "scalar":
-            self.temp_invm1 = nn.Parameter(torch.zeros(head_dim))
-            self.temp_invm1._group = "scalar"  # ty: ignore
+            self.qk_scale = nn.Parameter(torch.zeros(head_dim))
+            self.qk_scale._group = "scalar"  # ty: ignore
         self.q_norm = RMSNorm(head_dim, affine=temperature == "affine")
         self.k_norm = RMSNorm(head_dim, affine=temperature == "affine")
         self.rope = rope
@@ -104,9 +104,9 @@ class DecoderAttention(nn.Module):
             .chunk(3, dim=-2)
         )
         if self.temperature == "scalar":
-            scale = self.temp_invm1.add(1).abs().sqrt().type_as(input_BTD)
+            scale = F.softplus(self.qk_scale.add(0.541325)).type_as(input_BTD)
             q_BThd = self.rope(self.q_norm(q_BThd) * scale, *rotations)
-            k_BThd = self.rope(self.k_norm(k_BThd) * scale, *rotations)
+            k_BThd = self.rope(self.k_norm(k_BThd), *rotations)
         else:
             q_BThd = self.rope(self.q_norm(q_BThd), *rotations)
             k_BThd = self.rope(self.k_norm(k_BThd), *rotations)
@@ -231,10 +231,10 @@ class GPT(nn.Module):
         with torch.no_grad():
             metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
             if self.temperature == "scalar":
-                temps = torch.cat([block["attn"].temp_invm1 for block in self.blocks])  # ty: ignore
-                metrics["temp_param_mean"] = temps.mean()
-                metrics["temp_param_min"] = temps.min()
-                metrics["temp_param_max"] = temps.max()
+                scales = torch.cat([block["attn"].qk_scale for block in self.blocks])  # ty: ignore
+                metrics["qk_scale_mean"] = scales.mean()
+                metrics["qk_scale_min"] = scales.min()
+                metrics["qk_scale_max"] = scales.max()
         return logits, metrics
 
 
