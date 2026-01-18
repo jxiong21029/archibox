@@ -397,7 +397,7 @@ class Trainer:
         self.optimizer = DistMuon(
             parameters,
             lr=self.cfg.muon_lr,
-            momentum=self.cfg.muon_mu,
+            mu=self.cfg.muon_mu,
             adamw_betas=cfg.adamw_betas,
             weight_decay=self.cfg.weight_decay,
             nesterov=True,
