@@ -455,7 +455,7 @@ class Trainer:
 
         metrics.tick("forward")
         logits, fwd_metrics = self.model(inputs_ids.unsqueeze(0), self.rotations)
-        loss = F.cross_entropy(logits, target_ids)
+        loss = F.cross_entropy(logits[0], target_ids)
         assert torch.isfinite(loss)
         metrics.push(train_loss=loss, **fwd_metrics)
 
@@ -475,7 +475,7 @@ class Trainer:
             self.cfg.seq_len, self.rank, self.world_size, valid=True, device=self.device
         ):
             logits, fwd_metrics = self.model(input_ids.unsqueeze(0), self.rotations)
-            loss = F.cross_entropy(logits, target_ids)
+            loss = F.cross_entropy(logits[0], target_ids)
             metrics.push(loss=loss, **fwd_metrics)
 
         self.model.train()
