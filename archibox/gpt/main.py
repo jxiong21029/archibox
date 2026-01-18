@@ -326,9 +326,11 @@ class Trainer:
         self.raw_model = model
         if cfg.compile_mode is not None:
             model.compile(mode=cfg.compile_mode, dynamic=False)
-        self.model = DDP(
-            model, device_ids=[self.local_rank], output_device=self.local_rank
-        )
+        if self.is_distributed:
+            model = DDP(
+                model, device_ids=[self.local_rank], output_device=self.local_rank
+            )
+        self.model = model
 
         param_groups = {}
         for name, param in model.named_parameters():
