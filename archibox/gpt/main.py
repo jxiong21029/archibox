@@ -56,7 +56,7 @@ class Config(BaseModel):
     lr_cooldown_start: int = 1200
     lr_cooldown_ratio: float = 0.0
 
-    compile_mode: str | None = "default"
+    compile_mode: str | None = "max-autotune"
     dtype: str = "bfloat16"
     use_wandb: bool = True
     seed: int = 0
@@ -165,7 +165,7 @@ class GPT(nn.Module):
             p_zero_freqs=0.5,
         )
 
-        self.blocks = []
+        self.blocks = nn.ModuleList()
         for _ in range(depth):
             block = nn.ModuleDict()
             block["attn"] = DecoderAttention(
