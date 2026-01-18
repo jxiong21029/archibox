@@ -188,11 +188,12 @@ class GPT(nn.Module):
         pos = torch.arange(seq_len, device=device, dtype=torch.float32)
         cos, sin = self.rope.precompute_rotations(pos)
         rotations = (cos.to(dtype), sin.to(dtype))
+        self.dtype = dtype
 
         return rotations
 
     def forward(self, input_ids_BT: Tensor, rotations: tuple[Tensor, Tensor]):
-        x_BTD = self.embed(input_ids_BT)
+        x_BTD = self.embed(input_ids_BT).to(self.dtype)
 
         docs = (input_ids_BT == 50256).cumsum(0)
 
@@ -210,6 +211,7 @@ class GPT(nn.Module):
         for block in self.blocks:
             x_BTD = block["attn"](x_BTD, rotations, block_mask=block_mask)
             x_BTD = block["mlp"](x_BTD)
+        assert x_BTD.dtype == self.dtype
 
         logits = self.out_head(x_BTD)
         metrics = {}
