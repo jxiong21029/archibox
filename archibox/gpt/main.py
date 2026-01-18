@@ -101,7 +101,7 @@ class DecoderAttention(nn.Module):
             .chunk(3, dim=-2)
         )
         if self.temperature == "scalar":
-            scale = self.temp_invm1.add(1).sqrt()
+            scale = self.temp_invm1.add(1).sqrt().type_as(input_BTD)
             q_BThd = self.rope(self.q_norm(q_BThd) * scale, *rotations)
             k_BThd = self.rope(self.k_norm(k_BThd) * scale, *rotations)
         else:
