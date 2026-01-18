@@ -43,14 +43,14 @@ class Config(BaseModel):
     head_dim: int = 64
     mlp_dim: int = 3072
     depth: int = 12
-    temperature: Literal["affine", "scalar"] | None = "scalar"
+    temperature: Literal["affine", "scalar"] | None = None
     exnorm: bool = False
 
     muon_lr: float = 0.005
     muon_mu: float = 0.95
-    embed_lr: float = 0.01
+    embed_lr: float = 0.1
     scalar_lr: float = 0.005
-    low_rank_lr: float = 0.001
+    low_rank_lr: float = 0.003
     adamw_betas: tuple[float, float] = (0.95, 0.99)
     weight_decay: float = 0.1
     lr_cooldown_start: int = 12_000
@@ -196,19 +196,24 @@ class GPT(nn.Module):
 
         return rotations
 
-    def forward(self, input_ids_BT: Tensor, rotations: tuple[Tensor, Tensor]):
+    def forward(
+        self,
+        input_ids_BT: Tensor,
+        rotations: tuple[Tensor, Tensor],
+        target_ids: Tensor,
+    ):
         assert hasattr(self, "dtype") and isinstance(self.dtype, torch.dtype)
 
         B, T = input_ids_BT.size()
         assert B == 1
-        metrics = {}
+        # metrics = {}
 
         x_BTD = self.embed(input_ids_BT).to(self.dtype)
-        with torch.no_grad():
-            metrics["embed_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
-            metrics["embed_min_rms"] = (
-                self.embed.weight.square().mean(dim=-1).sqrt().min()
-            )
+        # with torch.no_grad():
+        #     metrics["embed_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
+        #     metrics["embed_min_rms"] = (
+        #         self.embed.weight.square().mean(dim=-1).sqrt().min()
+        #     )
 
         docs = (input_ids_BT[0] == 50256).cumsum(0)
 
@@ -229,14 +234,17 @@ class GPT(nn.Module):
         assert x_BTD.dtype == self.dtype
 
         logits = self.out_head(x_BTD)
-        with torch.no_grad():
-            metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
-            if self.temperature == "scalar":
-                scales = torch.cat([block["attn"].qk_scale for block in self.blocks])  # ty: ignore
-                metrics["qk_scale_mean"] = scales.mean()
-                metrics["qk_scale_min"] = scales.min()
-                metrics["qk_scale_max"] = scales.max()
-        return logits, metrics
+        # with torch.no_grad():
+        #     metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
+        #     if self.temperature == "scalar":
+        #         scales = torch.cat([block["attn"].qk_scale for block in self.blocks])  # ty: ignore
+        #         metrics["qk_scale_mean"] = scales.mean()
+        #         metrics["qk_scale_min"] = scales.min()
+        #         metrics["qk_scale_max"] = scales.max()
+        # return logits, metrics
+
+        loss = F.cross_entropy(logits[0].float(), target_ids)
+        return loss
 
 
 def _load_data_shard(file: Path):
