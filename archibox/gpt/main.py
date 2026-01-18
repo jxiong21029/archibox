@@ -34,7 +34,7 @@ class Config(BaseModel):
     run_name: str | None = None
     runs_dir: str = str(Path(__file__).parent / "runs")
     n_steps: int = 2000
-    seq_len: int = 4 * 1024
+    seq_len: int = 16 * 1024
     valid_every: int = 125
     valid_tokens: int = 10 * 1024 * 1024
 
