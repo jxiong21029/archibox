@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -14,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import wandb
-from bnnp import DistMuon, Metrics
+from bnnp import DistMuon, Metrics, parse_config
 from bnnp.nn import Embedding, FusedLinear, Output, RMSNorm, RoPE1d, mpparam
 from pydantic import BaseModel, ConfigDict
 from torch import Tensor
@@ -40,17 +39,19 @@ class Config(BaseModel):
     valid_every: int = 125
     valid_tokens: int = 10 * 1024 * 1024
 
+    vocab_size: int = 50257
     dim: int = 768
     head_dim: int = 64
     mlp_dim: int = 3072
     depth: int = 12
     temperature: Literal["affine", "scalar"] | None = "scalar"
-    vocab_size: int = 50257
+    exnorm: bool = False
 
     muon_lr: float = 0.01
     muon_mu: float = 0.95
+    embed_lr: float = 0.003
     scalar_lr: float = 0.003
-    embeds_lr: float = 0.003
+    low_rank_lr: float = 0.003
     adamw_betas: tuple[float, float] = (0.95, 0.99)
     weight_decay: float = 0.01
     lr_cooldown_start: int = 1200
@@ -68,16 +69,16 @@ class DecoderAttention(nn.Module):
         dim: int,
         head_dim: int,
         rope: RoPE1d,
-        temperature: Literal["affine", "scalar"] | None = "scalar",
-        exnorm: bool = True,
+        temperature: Literal["affine", "scalar"] | None,
+        exnorm: bool,
     ):
         assert head_dim % 4 == 0
         super().__init__()
         self.dim = dim
         self.head_dim = head_dim
         self.n_heads = dim // head_dim
-        self.exnorm = exnorm
         self.temperature = temperature
+        self.exnorm = exnorm
 
         self.in_norm = RMSNorm(dim, affine=False)
         self.qkv_weight = mpparam(3, dim, dim)
@@ -123,7 +124,7 @@ class DecoderAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int, exnorm: bool = True):
+    def __init__(self, dim: int, mlp_dim: int, exnorm: bool):
         super().__init__()
         self.dim = dim
         self.mlp_dim = mlp_dim
@@ -152,8 +153,8 @@ class GPT(nn.Module):
         head_dim: int,
         mlp_dim: int,
         depth: int,
-        temperature: Literal["affine", "scalar"] | None = "scalar",
-        exnorm: bool = True,
+        temperature: Literal["affine", "scalar"] | None,
+        exnorm: bool,
     ):
         super().__init__()
         self.embed = Embedding(vocab_size, dim)
@@ -179,6 +180,26 @@ class GPT(nn.Module):
             self.blocks.append(block)
         self.out_head = Output(dim, vocab_size)
 
+    def precompute_caches(
+        self,
+        seq_len: int,
+        window_size: int,
+        device: torch.device | str,
+        dtype=torch.dtype,
+    ):
+        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        cos, sin = self.rope.precompute_rotations(pos)
+        rotations = (cos.to(dtype), sin.to(dtype))
+
+        def mask_fn(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (q_idx < kv_idx + window_size)
+
+        block_mask = create_block_mask(
+            mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device
+        )
+
+        return rotations, block_mask
+
     def forward(self, input_ids_BT: Tensor):
         x_BTD = self.embed(input_ids_BT)
 
@@ -186,7 +207,11 @@ class GPT(nn.Module):
             x_BTD = block["attn"](x_BTD)
             x_BTD = block["mlp"](x_BTD)
 
-        return self.out_head(x_BTD)
+        logits = self.out_head(x_BTD)
+        metrics = {}
+        with torch.no_grad():
+            metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
+        return logits, metrics
 
 
 def _load_data_shard(file: Path):
@@ -222,7 +247,7 @@ def distributed_data_generator(seq_len: int, rank: int, world_size: int, valid: 
 
 
 class Trainer:
-    def __init__(self, cfg: Config, use_wandb: bool, do_compile: bool):
+    def __init__(self, cfg: Config):
         self.cfg = cfg
         logging.basicConfig(
             level=logging.INFO,
@@ -297,109 +322,157 @@ class Trainer:
             mlp_dim=cfg.mlp_dim,
             depth=cfg.depth,
             temperature=cfg.temperature,
+            exnorm=cfg.exnorm,
         ).to(self.device)
         self.raw_model = model
-        if do_compile:
-            model = torch.compile(model)
-        self.model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-        self.optimizer = DistMuon(
-            None,
-            lr=self.cfg.muon_lr,
-            momentum=self.cfg.muon_mu,
-            weight_decay=self.cfg.muon_wd,
+        if cfg.compile_mode is not None:
+            model.compile(mode=cfg.compile_mode, dynamic=False)
+        self.model = DDP(
+            model, device_ids=[self.local_rank], output_device=self.local_rank
         )
 
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
+        param_groups = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name_shape = f"{name!r} {tuple(param.shape)}"
 
-        if self.is_main_process and self.use_wandb:
-            OmegaConf.save(self.cfg, Path(wandb.run.dir) / "cfg.yaml")
+            old_attrs = ("_is_scalar", "_is_embed", "_is_output", "_no_weight_decay")
+            if any(hasattr(param, attr) for attr in old_attrs):
+                rank0logger.warning(
+                    f"Parameter {name_shape} has deprecated optimizer attributes: "
+                    + f"{[attr for attr in old_attrs if hasattr(param, attr)]}. "
+                    + "Use _group instead."
+                )
 
-        self.epoch = 0
-        self.step = 0
+            if not hasattr(param, "_group") or param._group == "muon":  # pyright: ignore
+                if param.ndim >= 2:
+                    group = "muon"
+                elif not hasattr(param, "_group"):
+                    raise ValueError(
+                        f"Parameter {name_shape} with <2 dims must be assigned a _group."
+                    )
+                else:
+                    raise ValueError(
+                        f"Parameter {name_shape} with <2 dims cannot be assigned group 'muon'."
+                    )
+            elif param._group not in ("embed", "scalar", "low_rank"):  # pyright: ignore
+                raise ValueError(
+                    f"Parameter {name_shape} has invalid _group attribute: {param._group}"  # pyright: ignore
+                )
+            else:
+                group = param._group  # pyright: ignore
 
-        self.log_once(f"starting @ step={self.step}, epoch={self.epoch}")
+            rank0logger.info(f"Parameter {name_shape} assigned to group {group!r}.")
+            param_groups.setdefault(group, []).append(param)
 
-    def log_once(self, s):
-        if self.is_main_process:
-            log.info(s)
-
-    def schedule_lr(self):
-        if (
-            self.cfg.lr_cooldown_start is not None
-            and self.step >= self.cfg.lr_cooldown_start
-        ):
-            frac = (self.step - self.cfg.lr_cooldown_start + 1) / (
-                self.cfg.n_steps - self.cfg.lr_cooldown_start
+        total_params, trainable_params, total_tensors = 0, 0, 0
+        for group, params in param_groups.items():
+            n_params = sum(p.numel() for p in params)
+            n_trainable = sum(p.numel() for p in params if p.requires_grad)
+            total_params += n_params
+            trainable_params += n_trainable
+            total_tensors += len(params)
+            rank0logger.info(
+                f"> Group {group}: {n_params:,} parameters ({n_trainable:,} trainable) over {len(params):,} tensors"
             )
-            relative_lr = 1.0 - (1 - self.cfg.lr_cooldown_ratio) * min(1.0, frac)
-            for opt in self.optims:
-                for group in opt.param_groups:
-                    group["lr"] = group["initial_lr"] * relative_lr
-        else:
-            relative_lr = 1.0
-        self.metrics.push(relative_lr=relative_lr)
+        rank0logger.info(
+            f"Total: {total_params:,} parameters ({n_trainable:,} trainable) over {len(params):,} tensors"
+        )
 
-    def train_step(self):
-        self.schedule_lr()
-        inputs_ids, target_ids = next(self.train_loader)
-        loss = self.model(inputs_ids, target_ids)
-        self.metrics.push(train_loss=loss)
-        loss.backward()
-        for optim in self.optims:
-            optim.step()
-        for optim in self.optims:
-            optim.zero_grad(set_to_none=True)
+        parameters = (
+            {
+                "params": params,
+                "algorithm": "muon" if group == "muon" else "adamw",
+                "lr": {
+                    "muon": cfg.muon_lr,
+                    "embed": cfg.embed_lr,
+                    "scalar": cfg.scalar_lr,
+                    "low_rank": cfg.low_rank_lr,
+                }[group],
+            }
+            for group, params in param_groups.items()
+        )
+        self.optimizer = DistMuon(
+            parameters,
+            lr=self.cfg.muon_lr,
+            momentum=self.cfg.muon_mu,
+            adamw_betas=cfg.adamw_betas,
+            weight_decay=self.cfg.weight_decay,
+            nesterov=True,
+        )
+        for group in self.optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
 
-    @torch.no_grad
-    def valid_epoch(self):
-        self.agent.eval()
-        for input_ids, target_ids in distributed_data_generator(
-            self.cfg.seq_len_valid, self.rank, self.world_size, valid=True
-        ):
-            self.metrics.push(valid_loss=self.model(input_ids, target_ids))
-        self.metrics.report()
-        self.agent.train()
+        self.step = 0
+        metrics.context = "train_"
 
     def run(self):
         with tqdm.tqdm(
-            total=self.cfg.n_steps, desc="training", mininterval=1.0, smoothing=0.05
-        ) as progress_bar:
-            if self.step == 0:
-                self.log_once("running initial validation epoch")
-                self.valid_epoch()
-            else:
-                progress_bar.update(self.step)
+            total=self.cfg.n_steps, desc="training", ncols=88, mininterval=3.0
+        ) as pbar:
+            if self.step > 0:
+                pbar.update(self.step)
             while self.step < self.cfg.n_steps:
-                self.train_step()
+                cd_start = self.cfg.lr_cooldown_start
+                if cd_start is not None and self.step > cd_start:
+                    cd_frac = (self.step - cd_start) / (self.cfg.n_steps - cd_start)
+                    relative_lr = 1.0 - cd_frac * (1 - self.cfg.lr_cooldown_ratio)
+                    for group in self.optimizer.param_groups:
+                        group["lr"] = group["initial_lr"] * relative_lr
+                else:
+                    relative_lr = 1.0
+                metrics.push(relative_lr=relative_lr)
 
-                if (
-                    self.cfg.valid_every is not None
-                    and (self.step + 1) % self.cfg.valid_every == 0
-                ) or self.step + 1 == self.cfg.n_steps:
+                self.train_step()
+                if (self.step + 1) % self.cfg.valid_every == 0:
                     self.valid_epoch()
+                metrics.commit(_step=self.step + 1)
 
                 self.step += 1
+                pbar.update(1)
 
-                progress_bar.update(1)
+    def train_step(self):
+        metrics.tick("load_batch")
+        inputs_ids, target_ids = next(self.train_loader)
+
+        metrics.tick("forward")
+        logits, fwd_metrics = self.model(inputs_ids)
+        loss = F.cross_entropy(logits, target_ids)
+        assert torch.isfinite(loss)
+        metrics.push(train_loss=loss, **fwd_metrics)
+
+        metrics.tick("backward")
+        loss.backward()
+
+        metrics.tick("optim")
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+    @torch.no_grad()
+    def valid_epoch(self):
+        self.model.eval()
+        metrics.context = "valid_"
+
+        for input_ids, target_ids in distributed_data_generator(
+            self.cfg.seq_len, self.rank, self.world_size, valid=True
+        ):
+            logits, fwd_metrics = self.model(input_ids)
+            loss = F.cross_entropy(logits, target_ids)
+            metrics.push(loss=loss, **fwd_metrics)
+
+        self.model.train()
+        metrics.context = "train_"
 
 
-def main():
-    logging.basicConfig(level=logging.INFO)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--no_wandb", action="store_true")
-    args = parser.parse_args()
-
-    cfg = Config()
-
+@parse_config
+def main(cfg: Config):
     try:
-        trainer = Trainer(cfg, not args.no_wandb, args.compile)
+        trainer = Trainer(cfg)
         trainer.run()
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
