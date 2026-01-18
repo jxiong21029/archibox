@@ -82,7 +82,7 @@ class DecoderAttention(nn.Module):
         self.temperature = temperature
         self.exnorm = exnorm
 
-        self.in_norm = RMSNorm(dim, affine=False)
+        # self.in_norm = RMSNorm(dim, affine=False)
         self.qkv_weight = mpparam(3, dim, dim)
         if temperature == "scalar":
             self.qk_scale = nn.Parameter(torch.zeros(head_dim))
@@ -96,7 +96,8 @@ class DecoderAttention(nn.Module):
         self, input_BTD: Tensor, rotations: tuple[Tensor, Tensor], block_mask: BlockMask
     ):
         B, T, _ = input_BTD.shape
-        x_BTD = self.in_norm(input_BTD)
+        # x_BTD = self.in_norm(input_BTD)
+        x_BTD = input_BTD
         qkv_weight = self.qkv_weight.flatten(0, 1).type_as(input_BTD)
         q_BThd, k_BThd, v_BThd = (
             (x_BTD @ qkv_weight.t())
@@ -133,12 +134,13 @@ class MLP(nn.Module):
         self.mlp_dim = mlp_dim
         self.exnorm = exnorm
 
-        self.in_norm = RMSNorm(dim, affine=False)
+        # self.in_norm = RMSNorm(dim, affine=False)
         self.up_proj = FusedLinear(dim, mlp_dim)
         self.down_proj = FusedLinear(mlp_dim, dim, zero_init=True)
 
     def forward(self, input_BTD: Tensor):
-        x_BTD = self.in_norm(input_BTD)
+        # x_BTD = self.in_norm(input_BTD)
+        x_BTD = input_BTD
         x_BTD = self.up_proj(x_BTD)
         x_BTD = F.relu(x_BTD).square()
         x_BTD = self.down_proj(x_BTD)
@@ -198,11 +200,14 @@ class GPT(nn.Module):
         return rotations
 
     def forward(self, input_ids_BT: Tensor, rotations: tuple[Tensor, Tensor]):
+        assert hasattr(self, "dtype") and isinstance(self.dtype, torch.dtype)
+
         B, T = input_ids_BT.size()
         assert B == 1
         metrics = {}
 
         x_BTD = self.embed(input_ids_BT).to(self.dtype)
+        x_BTD = F.rms_norm(x_BTD.float(), (x_BTD.size(-1),)).to(self.dtype)
         with torch.no_grad():
             metrics["embed_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
             metrics["embed_min_rms"] = (
