@@ -34,9 +34,9 @@ class Config(BaseModel):
     run_name: str | None = None
     runs_dir: str = str(Path(__file__).parent / "runs")
     n_steps: int = 2000
-    seq_len: int = 16 * 1024
+    seq_len: int = 64 * 1024
     valid_every: int = 125
-    valid_tokens: int = 10 * 1024 * 1024
+    valid_batches: int = 160
 
     vocab_size: int = 50257
     dim: int = 768
@@ -56,7 +56,7 @@ class Config(BaseModel):
     lr_cooldown_start: int = 1200
     lr_cooldown_ratio: float = 0.0
 
-    compile_mode: str | None = "max-autotune"
+    compile_mode: str | None = "default"
     dtype: str = "bfloat16"
     use_wandb: bool = True
     seed: int = 0
@@ -225,6 +225,7 @@ class GPT(nn.Module):
 
 
 def _load_data_shard(file: Path):
+    assert file.is_file()
     # header is 256 int32
     header = torch.from_file(str(file), False, 256, dtype=torch.int32)
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
@@ -471,9 +472,11 @@ class Trainer:
         self.model.eval()
         metrics.context = "valid_"
 
-        for input_ids, target_ids in distributed_data_generator(
+        valid_loader = distributed_data_generator(
             self.cfg.seq_len, self.rank, self.world_size, valid=True, device=self.device
-        ):
+        )
+        for _ in range(self.cfg.valid_batches):
+            input_ids, target_ids = next(valid_loader)
             logits, fwd_metrics = self.model(input_ids.unsqueeze(0), self.rotations)
             loss = F.cross_entropy(logits[0], target_ids)
             metrics.push(loss=loss, **fwd_metrics)
