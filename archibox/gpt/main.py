@@ -484,14 +484,14 @@ class Trainer:
         metrics.tick("forward")
         loss = self.model(inputs_ids.unsqueeze(0), self.rotations, target_ids)
         # loss = F.cross_entropy(logits[0].float(), target_ids)
-        if not torch.isfinite(loss):
-            # rank0logger.info(f"> Last step metrics: {fwd_metrics}")
-            for name, param in self.model.named_parameters():
-                dat = param.detach().cpu()
-                rank0logger.info(
-                    f"> Parameter {name} {tuple(param.shape)}: std={dat.std().item():.6f}, min={dat.min().item():.6f}, max={dat.max().item():.6f}"
-                )
-            raise ValueError(f"Non-finite loss encountered: {loss.item()}")
+        # if not torch.isfinite(loss):
+        #     # rank0logger.info(f"> Last step metrics: {fwd_metrics}")
+        #     for name, param in self.model.named_parameters():
+        #         dat = param.detach().cpu()
+        #         rank0logger.info(
+        #             f"> Parameter {name} {tuple(param.shape)}: std={dat.std().item():.6f}, min={dat.min().item():.6f}, max={dat.max().item():.6f}"
+        #         )
+        #     raise ValueError(f"Non-finite loss encountered: {loss.item()}")
         # metrics.push(loss=loss, logits_std=logits.std(), **fwd_metrics)
         metrics.push(loss=loss)
 
