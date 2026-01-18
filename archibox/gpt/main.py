@@ -51,7 +51,7 @@ class Config(BaseModel):
 
     muon_lr: float = 0.005
     muon_mu: float = 0.95
-    embed_lr: float = 0.01
+    embed_lr: float = 0.1
     scalar_lr: float = 0.005
     low_rank_lr: float = 0.001
     adamw_betas: tuple[float, float] = (0.95, 0.99)
@@ -207,7 +207,6 @@ class GPT(nn.Module):
         metrics = {}
 
         x_BTD = self.embed(input_ids_BT).to(self.dtype)
-        x_BTD = F.rms_norm(x_BTD.float(), (x_BTD.size(-1),)).to(self.dtype)
         with torch.no_grad():
             metrics["embed_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
             metrics["embed_min_rms"] = (
