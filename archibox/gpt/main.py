@@ -35,7 +35,7 @@ class Config(BaseModel):
     runs_dir: str = str(Path(__file__).parent / "runs")
     n_steps: int = 2000
     seq_len: int = 64 * 1024
-    valid_every: int = 125
+    valid_every: int = 250
     valid_batches: int = 160
 
     vocab_size: int = 50257
@@ -46,11 +46,11 @@ class Config(BaseModel):
     temperature: Literal["affine", "scalar"] | None = "scalar"
     exnorm: bool = False
 
-    muon_lr: float = 0.01
+    muon_lr: float = 0.005
     muon_mu: float = 0.95
-    embed_lr: float = 0.003
-    scalar_lr: float = 0.003
-    low_rank_lr: float = 0.003
+    embed_lr: float = 0.01
+    scalar_lr: float = 0.01
+    low_rank_lr: float = 0.001
     adamw_betas: tuple[float, float] = (0.95, 0.99)
     weight_decay: float = 0.01
     lr_cooldown_start: int = 1200
