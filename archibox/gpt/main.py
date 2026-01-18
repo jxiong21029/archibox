@@ -231,7 +231,7 @@ class GPT(nn.Module):
         with torch.no_grad():
             metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
             if self.temperature == "scalar":
-                temps = torch.cat([block["attn"].temp_invtm1 for block in self.blocks])  # ty: ignore
+                temps = torch.cat([block["attn"].temp_invm1 for block in self.blocks])  # ty: ignore
                 metrics["temp_param_mean"] = temps.mean()
                 metrics["temp_param_min"] = temps.min()
                 metrics["temp_param_max"] = temps.max()
