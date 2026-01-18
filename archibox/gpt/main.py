@@ -104,7 +104,7 @@ class DecoderAttention(nn.Module):
             .chunk(3, dim=-2)
         )
         if self.temperature == "scalar":
-            scale = self.temp_invm1.add(1).sqrt().type_as(input_BTD)
+            scale = self.temp_invm1.add(1).abs().sqrt().type_as(input_BTD)
             q_BThd = self.rope(self.q_norm(q_BThd) * scale, *rotations)
             k_BThd = self.rope(self.k_norm(k_BThd) * scale, *rotations)
         else:
@@ -160,6 +160,7 @@ class GPT(nn.Module):
         exnorm: bool,
     ):
         super().__init__()
+        self.temperature = temperature
         self.embed = Embedding(vocab_size, dim)
 
         self.rope = RoPE1d(
@@ -229,6 +230,11 @@ class GPT(nn.Module):
         logits = self.out_head(x_BTD)
         with torch.no_grad():
             metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
+            if self.temperature == "scalar":
+                temps = torch.cat([block["attn"].temp_invtm1 for block in self.blocks])
+                metrics["temp_param_mean"] = temps.mean()
+                metrics["temp_param_min"] = temps.min()
+                metrics["temp_param_max"] = temps.max()
         return logits, metrics
 
 
@@ -466,7 +472,14 @@ class Trainer:
         metrics.tick("forward")
         logits, fwd_metrics = self.model(inputs_ids.unsqueeze(0), self.rotations)
         loss = F.cross_entropy(logits[0].float(), target_ids)
-        assert torch.isfinite(loss)
+        if not torch.isfinite(loss):
+            rank0logger.error(f"Non-finite loss encountered: {loss.item()}")
+            rank0logger.info(f"> last step metrics: {fwd_metrics}")
+            for name, param in self.model.named_parameters():
+                dat = param.detach().cpu()
+                rank0logger.info(
+                    f"> Parameter {name} {tuple(param.shape)}: std={dat.std().item():.6f}, min={dat.min().item():.6f}, max={dat.max().item():.6f}"
+                )
         metrics.push(loss=loss, logits_std=logits.std(), **fwd_metrics)
 
         metrics.tick("backward")
