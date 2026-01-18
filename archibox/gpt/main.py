@@ -201,6 +201,9 @@ class GPT(nn.Module):
         x_BTD = self.embed(input_ids_BT).to(self.dtype)
         with torch.no_grad():
             metrics["embed_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
+            metrics["embed_min_rms"] = (
+                self.embed.weight.square().mean(dim=-1).sqrt().min()
+            )
 
         docs = (input_ids_BT[0] == 50256).cumsum(0)
 
