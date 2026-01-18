@@ -231,7 +231,7 @@ class GPT(nn.Module):
         with torch.no_grad():
             metrics["residual_rms"] = x_BTD.square().mean(dim=-1).sqrt().mean()
             if self.temperature == "scalar":
-                temps = torch.cat([block["attn"].temp_invtm1 for block in self.blocks])
+                temps = torch.cat([block["attn"].temp_invtm1 for block in self.blocks])  # ty: ignore
                 metrics["temp_param_mean"] = temps.mean()
                 metrics["temp_param_min"] = temps.min()
                 metrics["temp_param_max"] = temps.max()
@@ -473,13 +473,13 @@ class Trainer:
         logits, fwd_metrics = self.model(inputs_ids.unsqueeze(0), self.rotations)
         loss = F.cross_entropy(logits[0].float(), target_ids)
         if not torch.isfinite(loss):
-            rank0logger.error(f"Non-finite loss encountered: {loss.item()}")
-            rank0logger.info(f"> last step metrics: {fwd_metrics}")
+            rank0logger.info(f"> Last step metrics: {fwd_metrics}")
             for name, param in self.model.named_parameters():
                 dat = param.detach().cpu()
                 rank0logger.info(
                     f"> Parameter {name} {tuple(param.shape)}: std={dat.std().item():.6f}, min={dat.min().item():.6f}, max={dat.max().item():.6f}"
                 )
+            raise ValueError(f"Non-finite loss encountered: {loss.item()}")
         metrics.push(loss=loss, logits_std=logits.std(), **fwd_metrics)
 
         metrics.tick("backward")
