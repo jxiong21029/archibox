@@ -194,9 +194,12 @@ class GPT(nn.Module):
         return rotations
 
     def forward(self, input_ids_BT: Tensor, rotations: tuple[Tensor, Tensor]):
+        B, T = input_ids_BT.size()
+        assert B == 1
+
         x_BTD = self.embed(input_ids_BT).to(self.dtype)
 
-        docs = (input_ids_BT == 50256).cumsum(0)
+        docs = (input_ids_BT[0] == 50256).cumsum(0)
 
         def mask_fn(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -204,7 +207,6 @@ class GPT(nn.Module):
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & window_mask & document_mask
 
-        T = input_ids_BT.size(1)
         block_mask = create_block_mask(
             mask_fn, B=None, H=None, Q_LEN=T, KV_LEN=T, device=input_ids_BT.device
         )
