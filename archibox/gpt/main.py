@@ -179,10 +179,9 @@ class GPT(nn.Module):
             self.blocks.append(block)
         self.out_head = Output(dim, vocab_size)
 
-    def precompute_caches(
+    def precompute_rotations(
         self,
         seq_len: int,
-        window_size: int,
         device: torch.device | str,
         dtype=torch.dtype,
     ):
@@ -190,20 +189,26 @@ class GPT(nn.Module):
         cos, sin = self.rope.precompute_rotations(pos)
         rotations = (cos.to(dtype), sin.to(dtype))
 
-        def mask_fn(b, h, q_idx, kv_idx):
-            return (q_idx >= kv_idx) & (q_idx < kv_idx + window_size)
+        return rotations
 
-        block_mask = create_block_mask(
-            mask_fn, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device
-        )
-
-        return rotations, block_mask
-
-    def forward(self, input_ids_BT: Tensor):
+    def forward(self, input_ids_BT: Tensor, rotations: tuple[Tensor, Tensor]):
         x_BTD = self.embed(input_ids_BT)
 
+        docs = (input_ids_BT == 50256).cumsum(0)
+
+        def mask_fn(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            window_mask = q_idx - kv_idx < 1024
+            document_mask = docs[q_idx] == docs[kv_idx]
+            return causal_mask & window_mask & document_mask
+
+        T = input_ids_BT.size(1)
+        block_mask = create_block_mask(
+            mask_fn, B=None, H=None, Q_LEN=T, KV_LEN=T, device=input_ids_BT.device
+        )
+
         for block in self.blocks:
-            x_BTD = block["attn"](x_BTD)
+            x_BTD = block["attn"](x_BTD, rotations, block_mask=block_mask)
             x_BTD = block["mlp"](x_BTD)
 
         logits = self.out_head(x_BTD)
@@ -323,6 +328,9 @@ class Trainer:
             temperature=cfg.temperature,
             exnorm=cfg.exnorm,
         ).to(self.device)
+        self.rotations = model.precompute_rotations(
+            seq_len=cfg.seq_len, device=self.device, dtype=self.dtype
+        )
         self.raw_model = model
         if cfg.compile_mode is not None:
             model.compile(mode=cfg.compile_mode, dynamic=False)
@@ -378,7 +386,7 @@ class Trainer:
                 f"> Group {group}: {n_params:,} parameters ({n_trainable:,} trainable) over {len(params):,} tensors"
             )
         rank0logger.info(
-            f"Total: {total_params:,} parameters ({n_trainable:,} trainable) over {len(params):,} tensors"
+            f"Total: {total_params:,} parameters ({trainable_params:,} trainable) over {total_tensors:,} tensors"
         )
 
         parameters = (
